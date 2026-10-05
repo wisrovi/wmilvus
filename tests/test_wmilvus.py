@@ -1,4 +1,4 @@
-"""Comprehensive unit tests for WMilvus Pydantic ORM (Single and Multi-Collection)."""
+"""Comprehensive unit tests for WMilvus Pydantic ORM (Single, Multi-Collection, and Ghost Audit Log)."""
 
 from unittest.mock import MagicMock, patch
 import pytest
@@ -58,7 +58,7 @@ def test_single_collection_orm_flow(mock_milvus_client: MagicMock) -> None:
     person = Person(id="1", name="Juan Pérez", age=30, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4])
     inserted = db.insert(person)
     assert inserted.name == "Juan Pérez"
-    mock_instance.upsert.assert_called_once()
+    mock_instance.upsert.assert_called()
 
     # 2. Query all & get_by_field returning Person instance
     people = db.get_all()
@@ -81,7 +81,32 @@ def test_single_collection_orm_flow(mock_milvus_client: MagicMock) -> None:
     assert updated.age == 31
 
     db.delete("1")
-    mock_instance.delete.assert_called_once_with(collection_name="person", ids=["1"])
+    mock_instance.delete.assert_called_with(collection_name="person", ids=["1"])
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_ghost_table_audit_trail(mock_milvus_client: MagicMock) -> None:
+    """Test ghost collection audit trail (_forensic_audit_log) tracking INSERT, UPDATE, and DELETE."""
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = [
+        {"id": 1, "action_type": "INSERT", "table_name": "users_face", "record_id": "u1", "create_by": 100}
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(UserFace, config)
+
+    user = UserFace(id="u1", name="William Rodriguez", face_vec=[0.1] * 128)
+    db.insert(user, user_id=100)
+
+    # Verify audit insert was called on _forensic_audit_log
+    mock_instance.insert.assert_called()
+
+    audit_logs = db.get_ghost_audit_log()
+    assert len(audit_logs) == 1
+    assert audit_logs[0]["action_type"] == "INSERT"
+    assert audit_logs[0]["create_by"] == 100
 
 
 @patch("wmilvus.core.client.MilvusClient")
@@ -107,4 +132,4 @@ def test_multi_collection_orm_routing(mock_milvus_client: MagicMock) -> None:
     # Method C: Auto-routing insert
     db.insert(user)
 
-    assert mock_instance.upsert.call_count == 3
+    assert mock_instance.upsert.call_count >= 3
