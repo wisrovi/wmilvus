@@ -222,3 +222,5 @@ __marimo__/
 # Docker standalone media data
 environment/media/
 
+# Sphinx docs build directory
+docs/_build/
