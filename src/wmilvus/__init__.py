@@ -8,7 +8,14 @@ from wmilvus.exceptions import (
     VectorSearchError,
     WMilvusError,
 )
-from wmilvus.types import FieldVector, ForensicModel, SearchMatch, VectorRecord
+from wmilvus.types import (
+    FieldVector,
+    ForensicModel,
+    IndexType,
+    MetricType,
+    SearchMatch,
+    VectorRecord,
+)
 
 __version__ = "0.1.0"
 
@@ -16,6 +23,8 @@ __all__ = [
     "WMilvus",
     "CollectionRepository",
     "FieldVector",
+    "MetricType",
+    "IndexType",
     "ForensicModel",
     "VectorRecord",
     "SearchMatch",
