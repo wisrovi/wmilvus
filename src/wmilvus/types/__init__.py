@@ -1,9 +1,31 @@
-"""Milvus entity models, field vector annotations, enums, and result types."""
+"""Milvus entity models, field vector annotations, enums, normalization, and result types."""
 
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
 from pydantic import BaseModel, Field
+
+
+def normalize_vector(vec: Union[List[float], np.ndarray]) -> List[float]:
+    """Normalize a dense vector embedding to unit length (L2 norm = 1.0).
+
+    Args:
+        vec: Dense vector embedding as list or NumPy array.
+
+    Returns:
+        L2 normalized float list.
+    """
+    arr = (
+        np.array(vec, dtype=np.float32)
+        if not isinstance(vec, np.ndarray)
+        else vec.astype(np.float32)
+    )
+    norm = np.linalg.norm(arr)
+    if norm == 0:
+        return arr.tolist()
+    return (arr / norm).tolist()
 
 
 class MetricType(str, Enum):
@@ -51,13 +73,15 @@ def FieldVector(
     m_type = metric_type.value if isinstance(metric_type, MetricType) else str(metric_type)
     idx_type = index_type.value if isinstance(index_type, IndexType) else str(index_type)
 
-    json_schema_extra.update({
-        "is_vector": True,
-        "dim": dim,
-        "metric_type": m_type,
-        "index_type": idx_type,
-        "params": params or {"M": 16, "efConstruction": 200},
-    })
+    json_schema_extra.update(
+        {
+            "is_vector": True,
+            "dim": dim,
+            "metric_type": m_type,
+            "index_type": idx_type,
+            "params": params or {"M": 16, "efConstruction": 200},
+        }
+    )
 
     return Field(json_schema_extra=json_schema_extra, **kwargs)
 
