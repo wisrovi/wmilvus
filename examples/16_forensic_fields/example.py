@@ -21,11 +21,10 @@ class UserFace(ForensicModel):
 def main() -> None:
     print("--- Forensic Model Example in WMilvus ---")
 
-    db = WMilvus(UserFace, milvus_config)
-
-    user = UserFace(id="u_001", name="William Rodriguez", face_vec=[0.1] * 128)
-    db.insert(user, user_id=100)
-    print("Inserted UserFace with User ID=100 forensic tracking")
+    with WMilvus(UserFace, milvus_config) as db:
+        user = UserFace(id="u_001", name="William Rodriguez", face_vec=[0.1] * 128)
+        db.insert(user, user_id=100)
+        print("Inserted UserFace with User ID=100 forensic tracking")
 
 
 if __name__ == "__main__":
