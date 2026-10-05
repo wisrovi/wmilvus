@@ -24,6 +24,7 @@
 - **Hybrid Search (`search_hybrid`)** — Multi-modal search combining dense vector embeddings with text/scalar metadata filter expressions.
 - **Single & Multi-Collection ORM Routing** — Automatic collection creation and routing by model class (`db[Model]`), attribute (`db.modelname`), or main client auto-routing (`db.insert(instance)`).
 - **Enterprise Ghost Audit Log (`_forensic_audit_log`)** — Global audit trail tracking `INSERT`, `UPDATE`, `SOFT_DELETE`, and `HARD_DELETE` operations for models inheriting from `ForensicModel`.
+- **SQLite Vector Backup & Import (`wsqlite`)** — Native ORM-based backup export (`export_to_sqlite`) and restoration (`import_from_sqlite`) powered by `wsqlite`.
 - **Dockerized Test Runner & Coverage** — Out-of-the-box support for isolated container testing (`run_tests_docker.sh`) and HTML coverage reports (`run_coverage.sh`).
 
 ## Technical Stack
@@ -33,6 +34,7 @@
 | Language | Python 3.9+ |
 | Vector Engine | Milvus 2.3+ |
 | SDK Core | pymilvus 2.3+ |
+| Backup Storage | wsqlite 1.5+ |
 | Data Validation | Pydantic 2.x |
 | Numerical Core | NumPy |
 | Logging | Loguru |
@@ -97,6 +99,7 @@ The repository includes organized example scripts in `examples/`:
 - [`examples/05_async_client/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/05_async_client/example.py) — Async non-blocking client (`AsyncWMilvus`) for asyncio/FastAPI.
 - [`examples/06_schema_verification/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/06_schema_verification/example.py) — Milvus collection schema verification (`verify_schema`).
 - [`examples/07_hybrid_search/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/07_hybrid_search/example.py) — Hybrid similarity search (`search_hybrid`).
+- [`examples/08_sqlite_backup/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/08_sqlite_backup/example.py) — SQLite vector backup export and import powered by `wsqlite`.
 - [`examples/16_forensic_fields/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/16_forensic_fields/example.py) — Forensic field tracking (`create_by`, `create_in`, `update_by`).
 - [`examples/17_multi_table/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/17_multi_table/example.py) — Multi-collection management & repository routing.
 - [`examples/18_ghost_table_audit/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/18_ghost_table_audit/example.py) — Enterprise global audit trail (`_forensic_audit_log`).
