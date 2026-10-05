@@ -1,10 +1,10 @@
-"""Comprehensive unit tests for WMilvus Pydantic ORM (Single, Multi-Collection, and Ghost Audit Log)."""
+"""Comprehensive unit tests for WMilvus Pydantic ORM (Single, Multi-Collection, Batch, Range, Hybrid, Schema, and Async)."""
 
 from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
-from wmilvus import FieldVector, ForensicModel, WMilvus
+from wmilvus import AsyncWMilvus, FieldVector, ForensicModel, WMilvus
 
 
 class Person(BaseModel):
@@ -138,3 +138,87 @@ def test_multi_collection_orm_routing(mock_milvus_client: MagicMock) -> None:
     db.insert(user)
 
     assert mock_instance.upsert.call_count >= 3
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_batch_ingestion_and_range_search(mock_milvus_client: MagicMock) -> None:
+    """Test insert_batch, search_range_with_scores, search_hybrid, and verify_schema."""
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.describe_collection.return_value = {
+        "fields": [{"name": "vector", "params": {"dim": 4}}]
+    }
+    mock_instance.search.return_value = [
+        [
+            {
+                "id": "1",
+                "distance": 0.96,
+                "entity": {"id": "1", "name": "Juan Pérez", "age": 30, "is_active": True, "vector": [0.1, 0.2, 0.3, 0.4]},
+            }
+        ]
+    ]
+    mock_instance.query.return_value = [
+        {"id": "1", "name": "Juan Pérez", "age": 30, "is_active": True, "vector": [0.1, 0.2, 0.3, 0.4]}
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    # 1. Test insert_batch
+    persons = [
+        Person(id=f"{i}", name=f"User_{i}", age=20+i, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4])
+        for i in range(5)
+    ]
+    batch_res = db.insert_batch(persons, batch_size=2)
+    assert batch_res["inserted_count"] == 5
+    assert batch_res["batches_processed"] == 3
+
+    # 2. Test search_range_with_scores
+    range_matches = db.search_range_with_scores(vector=[0.1, 0.2, 0.3, 0.4], radius=0.90)
+    assert len(range_matches) == 1
+    assert range_matches[0].distance == 0.96
+
+    # 3. Test search_hybrid
+    hybrid_res = db.search_hybrid(vector=[0.1, 0.2, 0.3, 0.4], text_field="name", text_query="Juan")
+    assert len(hybrid_res) == 1
+
+    # 4. Test verify_schema
+    schema_res = db.verify_schema()
+    assert schema_res["status"] == "VALID"
+    assert schema_res["dimension"] == 4
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_async_client_flow(mock_milvus_client: MagicMock) -> None:
+    """Test AsyncWMilvus client operations using async/await."""
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = [
+        {"id": "1", "name": "Juan Pérez", "age": 30, "is_active": True, "vector": [0.1, 0.2, 0.3, 0.4]}
+    ]
+    mock_instance.search.return_value = [
+        [
+            {
+                "id": "1",
+                "distance": 0.99,
+                "entity": {"id": "1", "name": "Juan Pérez", "age": 30, "is_active": True, "vector": [0.1, 0.2, 0.3, 0.4]},
+            }
+        ]
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+
+    async def _run() -> None:
+        async with AsyncWMilvus(Person, config) as db:
+            person = Person(id="1", name="Juan Pérez", age=30, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4])
+            inserted = await db.insert(person)
+            assert inserted.name == "Juan Pérez"
+
+            matches = await db.search_similar(vector=[0.1, 0.2, 0.3, 0.4], top_k=1)
+            assert len(matches) == 1
+            assert matches[0].name == "Juan Pérez"
+
+    import asyncio
+    asyncio.run(_run())
