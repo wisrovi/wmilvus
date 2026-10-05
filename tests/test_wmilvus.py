@@ -70,11 +70,16 @@ def test_single_collection_orm_flow(mock_milvus_client: MagicMock) -> None:
     assert single_person is not None
     assert single_person.age == 30
 
-    # 3. Vector similarity search returning Person instance
+    # 3. Vector similarity search returning Person instance & with scores
     matches = db.search_similar(vector=[0.1, 0.2, 0.3, 0.4], top_k=1)
     assert len(matches) == 1
     assert isinstance(matches[0], Person)
     assert matches[0].name == "Juan Pérez"
+
+    matches_scores = db.search_similar_with_scores(vector=[0.1, 0.2, 0.3, 0.4], top_k=1)
+    assert len(matches_scores) == 1
+    assert matches_scores[0].id == "1"
+    assert matches_scores[0].distance == 0.99
 
     # 4. Update and Delete
     updated = db.update("1", Person(id="1", name="Juan Pérez", age=31, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4]))
