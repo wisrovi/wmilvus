@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wmilvus"
+version = "0.1.0"
+authors = [
+    { name = "WILLIAM R.", email = "wisrovi.rodriguez@gmail.com" },
+]
+description = "Milvus vector database client using Pydantic models - simple, type-safe vector search and management"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Database :: Database Engines/Servers",
+]
+dependencies = [
+    "pymilvus>=2.3.0",
+    "pydantic>=2.0.0",
+    "loguru>=0.7.0",
+    "click>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "black>=23.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+wmilvus = "wmilvus.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/wisrovi/wmilvus"
+Documentation = "https://github.com/wisrovi/wmilvus#readme"
+Repository = "https://github.com/wisrovi/wmilvus"
+Issues = "https://github.com/wisrovi/wmilvus/issues"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+exclude = ["examples/", "docs/"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["wmilvus"]
+omit = ["*/tests/*", "*/test_*.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
