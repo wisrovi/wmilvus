@@ -1,6 +1,7 @@
 """WMilvus Pydantic ORM Repository and Multi-Collection Client."""
 
 import inspect
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Type, Union
 from loguru import logger
@@ -10,6 +11,8 @@ from pymilvus import DataType, MilvusClient
 
 from wmilvus.exceptions import CollectionError, ConnectionError, VectorSearchError
 from wmilvus.types import FieldVector, ForensicModel, SearchMatch, VectorRecord
+
+GHOST_AUDIT_LOG_COLLECTION = "_forensic_audit_log"
 
 
 def get_model_tablename(model_cls: Type[BaseModel]) -> str:
@@ -51,6 +54,44 @@ def inspect_model_vector_field(model_cls: Type[BaseModel]) -> Dict[str, Any]:
         "index_type": "HNSW",
         "params": {"M": 16, "efConstruction": 200},
     }
+
+
+def ensure_ghost_audit_log_collection(client: MilvusClient) -> None:
+    """Ensure global _forensic_audit_log collection exists in Milvus."""
+    if not client.has_collection(collection_name=GHOST_AUDIT_LOG_COLLECTION):
+        client.create_collection(
+            collection_name=GHOST_AUDIT_LOG_COLLECTION,
+            dimension=2,
+            metric_type="L2",
+            auto_id=True,
+            id_type=DataType.INT64,
+        )
+        logger.info(f"Created global ghost audit log collection '{GHOST_AUDIT_LOG_COLLECTION}'")
+
+
+def record_ghost_audit(
+    client: MilvusClient,
+    action_type: str,
+    table_name: str,
+    record_id: str,
+    data_before: Optional[Dict[str, Any]] = None,
+    data_after: Optional[Dict[str, Any]] = None,
+    user_id: Optional[int] = 1,
+) -> None:
+    """Record an audit trail event in the global _forensic_audit_log collection."""
+    ensure_ghost_audit_log_collection(client)
+    now_str = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "vector": [0.0, 0.0],
+        "action_type": action_type,
+        "table_name": table_name,
+        "record_id": str(record_id),
+        "data_before": json.dumps(data_before) if data_before else "",
+        "data_after": json.dumps(data_after) if data_after else "",
+        "create_by": user_id or 1,
+        "create_in": now_str,
+    }
+    client.insert(collection_name=GHOST_AUDIT_LOG_COLLECTION, data=[payload])
 
 
 class CollectionRepository:
@@ -98,6 +139,17 @@ class CollectionRepository:
         }
 
         self.client.upsert(collection_name=self.collection_name, data=[payload])
+
+        if self.forensic:
+            record_ghost_audit(
+                client=self.client,
+                action_type="INSERT",
+                table_name=self.collection_name,
+                record_id=str(data_dict.get("id", "")),
+                data_after={k: v for k, v in data_dict.items() if k != vector_field_name},
+                user_id=user_id,
+            )
+
         return record
 
     def get_all(self, limit: int = 100) -> List[BaseModel]:
@@ -165,7 +217,10 @@ class CollectionRepository:
         return results
 
     def update(self, record_id: str, record: BaseModel, user_id: Optional[int] = None) -> BaseModel:
-        """Update existing record in Milvus collection."""
+        """Update existing record in Milvus collection with forensic audit logging."""
+        before_item = self.get_by_field(id=record_id)
+        data_before = before_item.model_dump() if before_item else None
+
         data_dict = record.model_dump()
         vector_field_name = self.vector_meta["field_name"]
         if self.forensic and user_id is not None:
@@ -177,11 +232,37 @@ class CollectionRepository:
             **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
         }
         self.client.upsert(collection_name=self.collection_name, data=[payload])
+
+        if self.forensic:
+            record_ghost_audit(
+                client=self.client,
+                action_type="UPDATE",
+                table_name=self.collection_name,
+                record_id=str(record_id),
+                data_before={k: v for k, v in data_before.items() if k != vector_field_name} if data_before else None,
+                data_after={k: v for k, v in data_dict.items() if k != vector_field_name},
+                user_id=user_id,
+            )
+
         return record
 
     def delete(self, record_id: str, user_id: Optional[int] = None, hard: bool = True) -> None:
-        """Delete record by ID from Milvus collection."""
+        """Delete record by ID from Milvus collection with forensic audit logging."""
+        before_item = self.get_by_field(id=record_id)
+        data_before = before_item.model_dump() if before_item else None
+        vector_field_name = self.vector_meta["field_name"]
+
         self.client.delete(collection_name=self.collection_name, ids=[str(record_id)])
+
+        if self.forensic:
+            record_ghost_audit(
+                client=self.client,
+                action_type="HARD_DELETE" if hard else "SOFT_DELETE",
+                table_name=self.collection_name,
+                record_id=str(record_id),
+                data_before={k: v for k, v in data_before.items() if k != vector_field_name} if data_before else None,
+                user_id=user_id,
+            )
 
 
 class WMilvus:
@@ -243,6 +324,16 @@ class WMilvus:
             table_name = get_model_tablename(model_cls)
             self._attr_repos[table_name.lower()] = repo
             self._attr_repos[model_cls.__name__.lower()] = repo
+
+    def get_ghost_audit_log(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieve recorded entries from the global _forensic_audit_log collection."""
+        ensure_ghost_audit_log_collection(self.client)
+        return self.client.query(
+            collection_name=GHOST_AUDIT_LOG_COLLECTION,
+            filter='table_name != ""',
+            output_fields=["*"],
+            limit=limit,
+        )
 
     def __getitem__(self, item: Type[BaseModel]) -> CollectionRepository:
         if item in self.repositories:
