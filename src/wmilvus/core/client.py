@@ -1,17 +1,16 @@
 """WMilvus Pydantic ORM Repository and Multi-Collection Client."""
 
 import asyncio
-import inspect
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Type, Union
-from loguru import logger
+
 import numpy as np
+from loguru import logger
 from pydantic import BaseModel
 from pymilvus import DataType, MilvusClient
-
-from wmilvus.exceptions import CollectionError, ConnectionError, ValidationError, VectorSearchError
-from wmilvus.types import FieldVector, ForensicModel, SearchMatch, VectorRecord
+from wmilvus.exceptions import CollectionError, ConnectionError, ValidationError
+from wmilvus.types import ForensicModel, SearchMatch
 
 GHOST_AUDIT_LOG_COLLECTION = "_forensic_audit_log"
 
@@ -19,9 +18,9 @@ GHOST_AUDIT_LOG_COLLECTION = "_forensic_audit_log"
 def get_model_tablename(model_cls: Type[BaseModel]) -> str:
     """Extract table/collection name from Pydantic model class attribute or class name."""
     if hasattr(model_cls, "__tablename__"):
-        return getattr(model_cls, "__tablename__")
+        return model_cls.__tablename__
     if hasattr(model_cls, "__collection_name__"):
-        return getattr(model_cls, "__collection_name__")
+        return model_cls.__collection_name__
     return model_cls.__name__.lower()
 
 
@@ -88,7 +87,9 @@ def record_ghost_audit(
 class CollectionRepository:
     """Repository bound to a specific Pydantic model class for single-collection ORM operations."""
 
-    def __init__(self, client: MilvusClient, model_cls: Type[BaseModel], forensic: bool = False) -> None:
+    def __init__(
+        self, client: MilvusClient, model_cls: Type[BaseModel], forensic: bool = False
+    ) -> None:
         self.client = client
         self.model_cls = model_cls
         self.collection_name = get_model_tablename(model_cls)
@@ -106,7 +107,9 @@ class CollectionRepository:
                 id_type=DataType.VARCHAR,
                 max_length=64,
             )
-            logger.info(f"Created collection '{self.collection_name}' for model {self.model_cls.__name__}")
+            logger.info(
+                f"Created collection '{self.collection_name}' for model {self.model_cls.__name__}"
+            )
 
     def insert(self, record: BaseModel, user_id: Optional[int] = 1) -> BaseModel:
         """Insert a single typed Pydantic model instance into Milvus with forensic audit logging."""
@@ -123,6 +126,10 @@ class CollectionRepository:
             **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
         }
         self.client.upsert(collection_name=self.collection_name, data=[payload])
+        try:
+            self.client.flush(collection_name=self.collection_name)
+        except Exception:
+            pass
 
         if self.forensic:
             record_ghost_audit(
@@ -167,7 +174,14 @@ class CollectionRepository:
 
             self.client.upsert(collection_name=self.collection_name, data=payload_batch)
             batches_processed += 1
-            logger.info(f"Inserted batch {batches_processed} ({len(chunk)} records) into '{self.collection_name}'")
+            logger.info(
+                f"Inserted batch {batches_processed} ({len(chunk)} records) into '{self.collection_name}'"
+            )
+
+        try:
+            self.client.flush(collection_name=self.collection_name)
+        except Exception:
+            pass
 
         if self.forensic and records:
             record_ghost_audit(
@@ -185,7 +199,7 @@ class CollectionRepository:
         """Query all records from the collection up to the specified limit."""
         raw_items = self.client.query(
             collection_name=self.collection_name,
-            filter='id != ""',
+            filter="id != '0'",
             output_fields=["*"],
             limit=limit,
         )
@@ -203,7 +217,11 @@ class CollectionRepository:
         if not kwargs:
             return None
         field_name, field_value = next(iter(kwargs.items()))
-        filter_expr = f'{field_name} == "{field_value}"' if isinstance(field_value, str) else f"{field_name} == {field_value}"
+        filter_expr = (
+            f'{field_name} == "{field_value}"'
+            if isinstance(field_value, str)
+            else f"{field_name} == {field_value}"
+        )
         raw_items = self.client.query(
             collection_name=self.collection_name,
             filter=filter_expr,
@@ -278,7 +296,9 @@ class CollectionRepository:
         filter_expr: str = "",
     ) -> List[BaseModel]:
         """Perform vector similarity range search filtering by minimum similarity score / radius threshold."""
-        matches_scores = self.search_range_with_scores(vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr)
+        matches_scores = self.search_range_with_scores(
+            vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+        )
         results: List[BaseModel] = []
         for match in matches_scores:
             rec = self.get_by_field(id=match.id)
@@ -294,7 +314,9 @@ class CollectionRepository:
         filter_expr: str = "",
     ) -> List[SearchMatch]:
         """Perform vector similarity range search returning SearchMatch items above radius score."""
-        all_matches = self.search_similar_with_scores(vector=vector, top_k=top_k, filter_expr=filter_expr)
+        all_matches = self.search_similar_with_scores(
+            vector=vector, top_k=top_k, filter_expr=filter_expr
+        )
         return [m for m in all_matches if m.distance >= radius]
 
     def search_hybrid(
@@ -332,13 +354,17 @@ class CollectionRepository:
                 params = f.get("params", {})
                 coll_dim = params.get("dim") or f.get("dim")
                 if coll_dim and int(coll_dim) != int(dim):
-                    mismatches.append(f"Dimension mismatch: model expects {dim}, collection has {coll_dim}")
+                    mismatches.append(
+                        f"Dimension mismatch: model expects {dim}, collection has {coll_dim}"
+                    )
 
         if not vector_field_found:
             mismatches.append("Vector field 'vector' not found in collection schema")
 
         if mismatches:
-            raise ValidationError(f"Schema verification failed for collection '{self.collection_name}': {'; '.join(mismatches)}")
+            raise ValidationError(
+                f"Schema verification failed for collection '{self.collection_name}': {'; '.join(mismatches)}"
+            )
 
         return {
             "status": "VALID",
@@ -371,7 +397,9 @@ class CollectionRepository:
                 action_type="UPDATE",
                 table_name=self.collection_name,
                 record_id=str(record_id),
-                data_before={k: v for k, v in data_before.items() if k != vector_field_name} if data_before else None,
+                data_before={k: v for k, v in data_before.items() if k != vector_field_name}
+                if data_before
+                else None,
                 data_after={k: v for k, v in data_dict.items() if k != vector_field_name},
                 user_id=user_id,
             )
@@ -392,7 +420,9 @@ class CollectionRepository:
                 action_type="HARD_DELETE" if hard else "SOFT_DELETE",
                 table_name=self.collection_name,
                 record_id=str(record_id),
-                data_before={k: v for k, v in data_before.items() if k != vector_field_name} if data_before else None,
+                data_before={k: v for k, v in data_before.items() if k != vector_field_name}
+                if data_before
+                else None,
                 user_id=user_id,
             )
 
@@ -464,7 +494,9 @@ class WMilvus:
         repo = self[model_cls]
         return repo.insert(record, user_id=user_id)
 
-    def insert_batch(self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1) -> Dict[str, Any]:
+    def insert_batch(
+        self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
+    ) -> Dict[str, Any]:
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
         model_cls = records[0].__class__
@@ -475,13 +507,17 @@ class WMilvus:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.get_all(limit=limit)
-        raise CollectionError("get_all() on main WMilvus instance is only valid in single-collection mode")
+        raise CollectionError(
+            "get_all() on main WMilvus instance is only valid in single-collection mode"
+        )
 
     def get_by_field(self, **kwargs: Any) -> Optional[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.get_by_field(**kwargs)
-        raise CollectionError("get_by_field() on main WMilvus instance is only valid in single-collection mode")
+        raise CollectionError(
+            "get_by_field() on main WMilvus instance is only valid in single-collection mode"
+        )
 
     def search_similar(
         self,
@@ -492,7 +528,9 @@ class WMilvus:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_similar(vector=vector, top_k=top_k, filter_expr=filter_expr)
-        raise CollectionError("search_similar() on main WMilvus instance is only valid in single-collection mode")
+        raise CollectionError(
+            "search_similar() on main WMilvus instance is only valid in single-collection mode"
+        )
 
     def search_similar_with_scores(
         self,
@@ -502,8 +540,12 @@ class WMilvus:
     ) -> List[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.search_similar_with_scores(vector=vector, top_k=top_k, filter_expr=filter_expr)
-        raise CollectionError("search_similar_with_scores() on main WMilvus instance is only valid in single-collection mode")
+            return single_repo.search_similar_with_scores(
+                vector=vector, top_k=top_k, filter_expr=filter_expr
+            )
+        raise CollectionError(
+            "search_similar_with_scores() on main WMilvus instance is only valid in single-collection mode"
+        )
 
     def search_range(
         self,
@@ -514,8 +556,12 @@ class WMilvus:
     ) -> List[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.search_range(vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr)
-        raise CollectionError("search_range() on main WMilvus instance is only valid in single-collection mode")
+            return single_repo.search_range(
+                vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+            )
+        raise CollectionError(
+            "search_range() on main WMilvus instance is only valid in single-collection mode"
+        )
 
     def search_range_with_scores(
         self,
@@ -526,8 +572,12 @@ class WMilvus:
     ) -> List[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.search_range_with_scores(vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr)
-        raise CollectionError("search_range_with_scores() on main WMilvus instance is only valid in single-collection mode")
+            return single_repo.search_range_with_scores(
+                vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+            )
+        raise CollectionError(
+            "search_range_with_scores() on main WMilvus instance is only valid in single-collection mode"
+        )
 
     def search_hybrid(
         self,
@@ -539,14 +589,24 @@ class WMilvus:
     ) -> List[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.search_hybrid(vector=vector, text_query=text_query, text_field=text_field, filter_expr=filter_expr, top_k=top_k)
-        raise CollectionError("search_hybrid() on main WMilvus instance is only valid in single-collection mode")
+            return single_repo.search_hybrid(
+                vector=vector,
+                text_query=text_query,
+                text_field=text_field,
+                filter_expr=filter_expr,
+                top_k=top_k,
+            )
+        raise CollectionError(
+            "search_hybrid() on main WMilvus instance is only valid in single-collection mode"
+        )
 
     def verify_schema(self) -> Dict[str, Any]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.verify_schema()
-        raise CollectionError("verify_schema() on main WMilvus instance is only valid in single-collection mode")
+        raise CollectionError(
+            "verify_schema() on main WMilvus instance is only valid in single-collection mode"
+        )
 
     def update(self, record_id: str, record: BaseModel, user_id: Optional[int] = None) -> BaseModel:
         model_cls = record.__class__
@@ -558,13 +618,15 @@ class WMilvus:
             single_repo = next(iter(self.repositories.values()))
             single_repo.delete(record_id, user_id=user_id)
         else:
-            raise CollectionError("delete() on main WMilvus instance requires specifying repository in multi-collection mode")
+            raise CollectionError(
+                "delete() on main WMilvus instance requires specifying repository in multi-collection mode"
+            )
 
     def get_ghost_audit_log(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Fetch recorded audit events from global _forensic_audit_log ghost collection."""
         raw_items = self.client.query(
             collection_name=GHOST_AUDIT_LOG_COLLECTION,
-            filter='id != 0',
+            filter="id != 0",
             output_fields=["*"],
             limit=limit,
         )
@@ -594,8 +656,12 @@ class AsyncCollectionRepository:
     async def insert(self, record: BaseModel, user_id: Optional[int] = 1) -> BaseModel:
         return await asyncio.to_thread(self._repo.insert, record, user_id=user_id)
 
-    async def insert_batch(self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1) -> Dict[str, Any]:
-        return await asyncio.to_thread(self._repo.insert_batch, records, batch_size=batch_size, user_id=user_id)
+    async def insert_batch(
+        self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
+    ) -> Dict[str, Any]:
+        return await asyncio.to_thread(
+            self._repo.insert_batch, records, batch_size=batch_size, user_id=user_id
+        )
 
     async def get_all(self, limit: int = 100) -> List[BaseModel]:
         return await asyncio.to_thread(self._repo.get_all, limit=limit)
@@ -603,25 +669,69 @@ class AsyncCollectionRepository:
     async def get_by_field(self, **kwargs: Any) -> Optional[BaseModel]:
         return await asyncio.to_thread(self._repo.get_by_field, **kwargs)
 
-    async def search_similar(self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = "") -> List[BaseModel]:
-        return await asyncio.to_thread(self._repo.search_similar, vector, top_k=top_k, filter_expr=filter_expr)
+    async def search_similar(
+        self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    ) -> List[BaseModel]:
+        return await asyncio.to_thread(
+            self._repo.search_similar, vector, top_k=top_k, filter_expr=filter_expr
+        )
 
-    async def search_similar_with_scores(self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = "") -> List[SearchMatch]:
-        return await asyncio.to_thread(self._repo.search_similar_with_scores, vector, top_k=top_k, filter_expr=filter_expr)
+    async def search_similar_with_scores(
+        self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    ) -> List[SearchMatch]:
+        return await asyncio.to_thread(
+            self._repo.search_similar_with_scores, vector, top_k=top_k, filter_expr=filter_expr
+        )
 
-    async def search_range(self, vector: Union[List[float], np.ndarray], radius: float = 0.8, top_k: int = 10, filter_expr: str = "") -> List[BaseModel]:
-        return await asyncio.to_thread(self._repo.search_range, vector, radius=radius, top_k=top_k, filter_expr=filter_expr)
+    async def search_range(
+        self,
+        vector: Union[List[float], np.ndarray],
+        radius: float = 0.8,
+        top_k: int = 10,
+        filter_expr: str = "",
+    ) -> List[BaseModel]:
+        return await asyncio.to_thread(
+            self._repo.search_range, vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+        )
 
-    async def search_range_with_scores(self, vector: Union[List[float], np.ndarray], radius: float = 0.8, top_k: int = 10, filter_expr: str = "") -> List[SearchMatch]:
-        return await asyncio.to_thread(self._repo.search_range_with_scores, vector, radius=radius, top_k=top_k, filter_expr=filter_expr)
+    async def search_range_with_scores(
+        self,
+        vector: Union[List[float], np.ndarray],
+        radius: float = 0.8,
+        top_k: int = 10,
+        filter_expr: str = "",
+    ) -> List[SearchMatch]:
+        return await asyncio.to_thread(
+            self._repo.search_range_with_scores,
+            vector,
+            radius=radius,
+            top_k=top_k,
+            filter_expr=filter_expr,
+        )
 
-    async def search_hybrid(self, vector: Union[List[float], np.ndarray], text_query: Optional[str] = None, text_field: Optional[str] = None, filter_expr: str = "", top_k: int = 5) -> List[BaseModel]:
-        return await asyncio.to_thread(self._repo.search_hybrid, vector, text_query=text_query, text_field=text_field, filter_expr=filter_expr, top_k=top_k)
+    async def search_hybrid(
+        self,
+        vector: Union[List[float], np.ndarray],
+        text_query: Optional[str] = None,
+        text_field: Optional[str] = None,
+        filter_expr: str = "",
+        top_k: int = 5,
+    ) -> List[BaseModel]:
+        return await asyncio.to_thread(
+            self._repo.search_hybrid,
+            vector,
+            text_query=text_query,
+            text_field=text_field,
+            filter_expr=filter_expr,
+            top_k=top_k,
+        )
 
     async def verify_schema(self) -> Dict[str, Any]:
         return await asyncio.to_thread(self._repo.verify_schema)
 
-    async def update(self, record_id: str, record: BaseModel, user_id: Optional[int] = None) -> BaseModel:
+    async def update(
+        self, record_id: str, record: BaseModel, user_id: Optional[int] = None
+    ) -> BaseModel:
         return await asyncio.to_thread(self._repo.update, record_id, record, user_id=user_id)
 
     async def delete(self, record_id: str, user_id: Optional[int] = None) -> None:
@@ -640,7 +750,8 @@ class AsyncWMilvus:
     ) -> None:
         self._sync_client = WMilvus(models, config=config, forensic=forensic, **kwargs)
         self.repositories: Dict[Type[BaseModel], AsyncCollectionRepository] = {
-            cls: AsyncCollectionRepository(repo) for cls, repo in self._sync_client.repositories.items()
+            cls: AsyncCollectionRepository(repo)
+            for cls, repo in self._sync_client.repositories.items()
         }
         self._attr_repos: Dict[str, AsyncCollectionRepository] = {
             k: AsyncCollectionRepository(repo) for k, repo in self._sync_client._attr_repos.items()
@@ -662,7 +773,9 @@ class AsyncWMilvus:
         repo = self[model_cls]
         return await repo.insert(record, user_id=user_id)
 
-    async def insert_batch(self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1) -> Dict[str, Any]:
+    async def insert_batch(
+        self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
+    ) -> Dict[str, Any]:
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
         model_cls = records[0].__class__
@@ -673,51 +786,106 @@ class AsyncWMilvus:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.get_all(limit=limit)
-        raise CollectionError("get_all() on main AsyncWMilvus instance is only valid in single-collection mode")
+        raise CollectionError(
+            "get_all() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
 
     async def get_by_field(self, **kwargs: Any) -> Optional[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.get_by_field(**kwargs)
-        raise CollectionError("get_by_field() on main AsyncWMilvus instance is only valid in single-collection mode")
+        raise CollectionError(
+            "get_by_field() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
 
-    async def search_similar(self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = "") -> List[BaseModel]:
+    async def search_similar(
+        self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    ) -> List[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.search_similar(vector=vector, top_k=top_k, filter_expr=filter_expr)
-        raise CollectionError("search_similar() on main AsyncWMilvus instance is only valid in single-collection mode")
+            return await single_repo.search_similar(
+                vector=vector, top_k=top_k, filter_expr=filter_expr
+            )
+        raise CollectionError(
+            "search_similar() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
 
-    async def search_similar_with_scores(self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = "") -> List[SearchMatch]:
+    async def search_similar_with_scores(
+        self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    ) -> List[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.search_similar_with_scores(vector=vector, top_k=top_k, filter_expr=filter_expr)
-        raise CollectionError("search_similar_with_scores() on main AsyncWMilvus instance is only valid in single-collection mode")
+            return await single_repo.search_similar_with_scores(
+                vector=vector, top_k=top_k, filter_expr=filter_expr
+            )
+        raise CollectionError(
+            "search_similar_with_scores() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
 
-    async def search_range(self, vector: Union[List[float], np.ndarray], radius: float = 0.8, top_k: int = 10, filter_expr: str = "") -> List[BaseModel]:
+    async def search_range(
+        self,
+        vector: Union[List[float], np.ndarray],
+        radius: float = 0.8,
+        top_k: int = 10,
+        filter_expr: str = "",
+    ) -> List[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.search_range(vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr)
-        raise CollectionError("search_range() on main AsyncWMilvus instance is only valid in single-collection mode")
+            return await single_repo.search_range(
+                vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+            )
+        raise CollectionError(
+            "search_range() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
 
-    async def search_range_with_scores(self, vector: Union[List[float], np.ndarray], radius: float = 0.8, top_k: int = 10, filter_expr: str = "") -> List[SearchMatch]:
+    async def search_range_with_scores(
+        self,
+        vector: Union[List[float], np.ndarray],
+        radius: float = 0.8,
+        top_k: int = 10,
+        filter_expr: str = "",
+    ) -> List[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.search_range_with_scores(vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr)
-        raise CollectionError("search_range_with_scores() on main AsyncWMilvus instance is only valid in single-collection mode")
+            return await single_repo.search_range_with_scores(
+                vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+            )
+        raise CollectionError(
+            "search_range_with_scores() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
 
-    async def search_hybrid(self, vector: Union[List[float], np.ndarray], text_query: Optional[str] = None, text_field: Optional[str] = None, filter_expr: str = "", top_k: int = 5) -> List[BaseModel]:
+    async def search_hybrid(
+        self,
+        vector: Union[List[float], np.ndarray],
+        text_query: Optional[str] = None,
+        text_field: Optional[str] = None,
+        filter_expr: str = "",
+        top_k: int = 5,
+    ) -> List[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.search_hybrid(vector=vector, text_query=text_query, text_field=text_field, filter_expr=filter_expr, top_k=top_k)
-        raise CollectionError("search_hybrid() on main AsyncWMilvus instance is only valid in single-collection mode")
+            return await single_repo.search_hybrid(
+                vector=vector,
+                text_query=text_query,
+                text_field=text_field,
+                filter_expr=filter_expr,
+                top_k=top_k,
+            )
+        raise CollectionError(
+            "search_hybrid() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
 
     async def verify_schema(self) -> Dict[str, Any]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.verify_schema()
-        raise CollectionError("verify_schema() on main AsyncWMilvus instance is only valid in single-collection mode")
+        raise CollectionError(
+            "verify_schema() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
 
-    async def update(self, record_id: str, record: BaseModel, user_id: Optional[int] = None) -> BaseModel:
+    async def update(
+        self, record_id: str, record: BaseModel, user_id: Optional[int] = None
+    ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
         return await repo.update(record_id, record, user_id=user_id)
@@ -727,7 +895,9 @@ class AsyncWMilvus:
             single_repo = next(iter(self.repositories.values()))
             await single_repo.delete(record_id, user_id=user_id)
         else:
-            raise CollectionError("delete() on main AsyncWMilvus instance requires specifying repository in multi-collection mode")
+            raise CollectionError(
+                "delete() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
+            )
 
     async def get_ghost_audit_log(self, limit: int = 100) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._sync_client.get_ghost_audit_log, limit=limit)
