@@ -40,6 +40,21 @@ class WMilvus:
             logger.error(f"Failed to initialize MilvusClient connection to {uri}: {e}")
             raise ConnectionError(f"Connection failed to {uri}: {e}") from e
 
+    def close(self) -> None:
+        """Close underlying client connections."""
+        if hasattr(self.client, "close"):
+            try:
+                self.client.close()
+                logger.info("Closed MilvusClient connection")
+            except Exception as e:
+                logger.warning(f"Error while closing MilvusClient: {e}")
+
+    def __enter__(self) -> "WMilvus":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
     def ensure_collection(
         self,
         collection_name: str,
@@ -70,12 +85,14 @@ class WMilvus:
         self,
         collection_name: str,
         records: List[VectorRecord],
+        chunk_size: int = 1000,
     ) -> Dict[str, Any]:
-        """Performs batch insertion or update of vector records.
+        """Performs batch insertion or update of vector records with automatic chunking.
 
         Args:
             collection_name: Target collection name.
             records: List of typed VectorRecord items.
+            chunk_size: Maximum number of records per upsert request payload.
 
         Returns:
             Dictionary containing operation status and modified counts.
@@ -83,16 +100,31 @@ class WMilvus:
         if not records:
             return {"upsert_count": 0}
 
-        payload = [
-            {"id": item.id, "vector": item.vector, **item.metadata}
-            for item in records
-        ]
+        total_upserted = 0
+        last_result: Any = None
 
-        result = self.client.upsert(
-            collection_name=collection_name,
-            data=payload,
-        )
-        return dict(result) if isinstance(result, dict) else {"result": result}
+        for i in range(0, len(records), chunk_size):
+            chunk = records[i : i + chunk_size]
+            payload = [
+                {"id": item.id, "vector": item.vector, **item.metadata}
+                for item in chunk
+            ]
+
+            res = self.client.upsert(
+                collection_name=collection_name,
+                data=payload,
+            )
+            last_result = res
+            if isinstance(res, dict) and "upsert_count" in res:
+                total_upserted += int(res["upsert_count"])
+            else:
+                total_upserted += len(chunk)
+
+        if isinstance(last_result, dict):
+            summary = dict(last_result)
+            summary["upsert_count"] = total_upserted
+            return summary
+        return {"upsert_count": total_upserted, "result": last_result}
 
     def search_similar(
         self,
@@ -102,7 +134,7 @@ class WMilvus:
         filter_expr: str = "",
         output_fields: Optional[List[str]] = None,
     ) -> List[SearchMatch]:
-        """Queries the vector index for nearest neighbors.
+        """Queries the vector index for nearest neighbors for a single vector.
 
         Args:
             collection_name: Target collection name.
@@ -114,32 +146,99 @@ class WMilvus:
         Returns:
             List of structured SearchMatch instances sorted by similarity.
         """
-        vector_data: List[float] = (
-            query_vector.tolist() if isinstance(query_vector, np.ndarray) else query_vector
+        results = self.search_batch(
+            collection_name=collection_name,
+            query_vectors=[query_vector],
+            top_k=top_k,
+            filter_expr=filter_expr,
+            output_fields=output_fields,
         )
+        return results[0] if results else []
+
+    def search_batch(
+        self,
+        collection_name: str,
+        query_vectors: Union[List[List[float]], List[np.ndarray], np.ndarray],
+        top_k: int = 5,
+        filter_expr: str = "",
+        output_fields: Optional[List[str]] = None,
+    ) -> List[List[SearchMatch]]:
+        """Queries the vector index for nearest neighbors for a batch of query vectors.
+
+        Args:
+            collection_name: Target collection name.
+            query_vectors: Batch of input embedding vectors (list of lists, list of arrays, or 2D NumPy array).
+            top_k: Maximum number of closest matches to retrieve per query vector.
+            filter_expr: Optional scalar boolean filtering expression.
+            output_fields: Specific metadata fields to return (defaults to all).
+
+        Returns:
+            List of lists of SearchMatch instances sorted by similarity for each query vector.
+        """
+        if isinstance(query_vectors, np.ndarray):
+            vectors_list: List[List[float]] = query_vectors.tolist()
+        else:
+            vectors_list = [
+                v.tolist() if isinstance(v, np.ndarray) else v for v in query_vectors
+            ]
+
+        if not vectors_list:
+            return []
 
         try:
             search_output = self.client.search(
                 collection_name=collection_name,
-                data=[vector_data],
+                data=vectors_list,
                 limit=top_k,
                 filter=filter_expr,
                 output_fields=output_fields or ["*"],
             )
 
-            matches: List[SearchMatch] = []
-            if search_output and len(search_output) > 0:
-                for item in search_output[0]:
-                    entity = item.get("entity", {})
-                    entity_id = str(item.get("id", entity.get("id", "")))
-                    distance = float(item.get("distance", 0.0))
-                    metadata = {k: v for k, v in entity.items() if k not in ("id", "vector")}
-                    matches.append(SearchMatch(id=entity_id, distance=distance, metadata=metadata))
+            batch_matches: List[List[SearchMatch]] = []
+            if search_output:
+                for single_search_res in search_output:
+                    matches: List[SearchMatch] = []
+                    for item in single_search_res:
+                        entity = item.get("entity", {})
+                        entity_id = str(item.get("id", entity.get("id", "")))
+                        distance = float(item.get("distance", 0.0))
+                        metadata = {k: v for k, v in entity.items() if k not in ("id", "vector")}
+                        matches.append(SearchMatch(id=entity_id, distance=distance, metadata=metadata))
+                    batch_matches.append(matches)
 
-            return matches
+            return batch_matches
         except Exception as e:
             logger.error(f"Vector search failed on collection '{collection_name}': {e}")
             raise VectorSearchError(f"Search failed: {e}") from e
+
+    def query_scalar(
+        self,
+        collection_name: str,
+        filter_expr: str,
+        output_fields: Optional[List[str]] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves entities matching a scalar boolean expression without vector similarity search.
+
+        Args:
+            collection_name: Target collection identifier.
+            filter_expr: Scalar boolean expression (e.g. 'camera_id == "cam_1"').
+            output_fields: List of metadata field names to return.
+            limit: Maximum number of entities to retrieve.
+
+        Returns:
+            List of dictionaries containing matched entity metadata.
+        """
+        try:
+            return self.client.query(
+                collection_name=collection_name,
+                filter=filter_expr,
+                output_fields=output_fields or ["*"],
+                limit=limit,
+            )
+        except Exception as e:
+            logger.error(f"Scalar query failed on collection '{collection_name}': {e}")
+            raise VectorSearchError(f"Query failed: {e}") from e
 
     def delete_by_ids(self, collection_name: str, ids: List[str]) -> Dict[str, Any]:
         """Deletes vector entities matching the provided IDs.
