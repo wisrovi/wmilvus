@@ -31,6 +31,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "loguru>=0.7.0",
     "click>=8.0.0",
+    "wsqlite>=1.5.0",
 ]
 
 [project.optional-dependencies]
