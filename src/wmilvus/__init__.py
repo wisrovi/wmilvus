@@ -1,6 +1,11 @@
 """WMilvus - Milvus Vector Database ORM using Pydantic models."""
 
-from wmilvus.core.client import CollectionRepository, WMilvus
+from wmilvus.core.client import (
+    AsyncCollectionRepository,
+    AsyncWMilvus,
+    CollectionRepository,
+    WMilvus,
+)
 from wmilvus.exceptions import (
     CollectionError,
     ConnectionError,
@@ -21,7 +26,9 @@ __version__ = "0.1.0"
 
 __all__ = [
     "WMilvus",
+    "AsyncWMilvus",
     "CollectionRepository",
+    "AsyncCollectionRepository",
     "FieldVector",
     "MetricType",
     "IndexType",
