@@ -1,14 +1,35 @@
-"""Milvus entity models, field vector annotations, and result types."""
+"""Milvus entity models, field vector annotations, enums, and result types."""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
+
+
+class MetricType(str, Enum):
+    """Vector similarity metric types for Milvus indexing and search."""
+
+    COSINE = "COSINE"
+    L2 = "L2"
+    IP = "IP"
+    HAMMING = "HAMMING"
+    JACCARD = "JACCARD"
+
+
+class IndexType(str, Enum):
+    """Vector index algorithm types for Milvus."""
+
+    HNSW = "HNSW"
+    IVF_FLAT = "IVF_FLAT"
+    FLAT = "FLAT"
+    IVF_SQ8 = "IVF_SQ8"
+    IVF_PQ = "IVF_PQ"
 
 
 def FieldVector(
     dim: int = 128,
-    metric_type: str = "COSINE",
-    index_type: str = "HNSW",
+    metric_type: Union[str, MetricType] = MetricType.COSINE,
+    index_type: Union[str, IndexType] = IndexType.HNSW,
     params: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Any:
@@ -16,8 +37,8 @@ def FieldVector(
 
     Args:
         dim: Vector dimension length.
-        metric_type: Similarity metric type ('COSINE', 'L2', 'IP').
-        index_type: Index algorithm ('HNSW', 'IVF_FLAT', 'FLAT').
+        metric_type: Similarity metric type (MetricType.COSINE, MetricType.L2, MetricType.IP, etc.).
+        index_type: Index algorithm (IndexType.HNSW, IndexType.IVF_FLAT, IndexType.FLAT, etc.).
         params: Additional index building parameters.
 
     Returns:
@@ -26,15 +47,18 @@ def FieldVector(
     json_schema_extra = kwargs.pop("json_schema_extra", {})
     if not isinstance(json_schema_extra, dict):
         json_schema_extra = {}
-    
+
+    m_type = metric_type.value if isinstance(metric_type, MetricType) else str(metric_type)
+    idx_type = index_type.value if isinstance(index_type, IndexType) else str(index_type)
+
     json_schema_extra.update({
         "is_vector": True,
         "dim": dim,
-        "metric_type": metric_type,
-        "index_type": index_type,
+        "metric_type": m_type,
+        "index_type": idx_type,
         "params": params or {"M": 16, "efConstruction": 200},
     })
-    
+
     return Field(json_schema_extra=json_schema_extra, **kwargs)
 
 
