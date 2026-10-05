@@ -1,40 +1,65 @@
-"""Example usage of WMilvus wrapper."""
+"""Multi-table / Multi-collection Pydantic ORM demonstration for WMilvus."""
 
-import numpy as np
-from wmilvus import VectorRecord, WMilvus
+from typing import List
+from pydantic import BaseModel
+from wmilvus import FieldVector, ForensicModel, WMilvus
+
+
+class UserFace(ForensicModel):
+    """User account face embedding model with forensic auditing enabled."""
+
+    __tablename__ = "users_face"
+    id: str
+    name: str
+    email: str
+    face_vec: List[float] = FieldVector(dim=128, metric_type="COSINE")
+
+
+class ProductImage(BaseModel):
+    """Catalog product image embedding model."""
+
+    id: str
+    title: str
+    price: float
+    image_vec: List[float] = FieldVector(dim=64, metric_type="COSINE")
 
 
 def main() -> None:
-    # 1. Initialize client
-    milvus = WMilvus(uri="http://localhost:19530")
+    """Execute multi-collection Pydantic ORM demonstration."""
+    print("--- Initializing WMilvus in Multi-Collection Mode ---")
 
-    # 2. Ensure collection exists (e.g. 512-dim visual embeddings)
-    collection = "visual_embeddings_v1"
-    milvus.ensure_collection(collection_name=collection, dimension=512, metric_type="COSINE")
+    milvus_config = {
+        "uri": "http://localhost:19530",
+        "token": "",
+        "db_name": "default",
+    }
 
-    # 3. Upsert a batch of vectors with metadata
-    sample_vector = np.random.rand(512).astype(np.float32).tolist()
-    records = [
-        VectorRecord(
-            id="frame_00104",
-            vector=sample_vector,
-            metadata={"camera_id": "cam_entry_north", "confidence": 0.94, "label": "forklift"},
-        )
-    ]
-    upsert_res = milvus.upsert_batch(collection_name=collection, records=records)
-    print(f"Upsert result: {upsert_res}")
+    # 1. Initialize WMilvus with a list of Pydantic models
+    db = WMilvus([UserFace, ProductImage], db_config=milvus_config)
 
-    # 4. Perform vector similarity search
-    query = np.random.rand(512).astype(np.float32)
-    results = milvus.search_similar(
-        collection_name=collection,
-        query_vector=query,
-        top_k=3,
-        filter_expr='label == "forklift"',
+    user = UserFace(
+        id="u_001",
+        name="William Rodriguez",
+        email="william@example.com",
+        face_vec=[0.1] * 128,
+    )
+    product = ProductImage(
+        id="p_101",
+        title="Antigravity Vision AI",
+        price=199.99,
+        image_vec=[0.5] * 64,
     )
 
-    for match in results:
-        print(f"ID: {match.id} | Score: {match.distance:.4f} | Meta: {match.metadata}")
+    # Method A: Indexing by class (Type-safe)
+    db[UserFace].insert(user)
+
+    # Method B: Direct attribute access in lowercase
+    db.productimage.insert(product)
+
+    # Method C: Auto-routing insert via main db instance
+    db.insert(user)
+
+    print("Insertion complete across all Milvus collections!")
 
 
 if __name__ == "__main__":
