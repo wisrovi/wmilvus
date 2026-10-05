@@ -39,21 +39,20 @@ class ProductImage(BaseModel):
 def main() -> None:
     print("--- Initializing WMilvus in Multi-Collection Mode ---")
 
-    db = WMilvus([UserFace, ProductImage], milvus_config)
+    with WMilvus([UserFace, ProductImage], milvus_config) as db:
+        user = UserFace(id="u_001", name="William Rodriguez", email="william@example.com", face_vec=[0.1] * 128)
+        product = ProductImage(id="p_101", title="Antigravity Vision AI", price=199.99, image_vec=[0.5] * 64)
 
-    user = UserFace(id="u_001", name="William Rodriguez", email="william@example.com", face_vec=[0.1] * 128)
-    product = ProductImage(id="p_101", title="Antigravity Vision AI", price=199.99, image_vec=[0.5] * 64)
+        # Method A: Indexing by class (Type-safe)
+        db[UserFace].insert(user)
 
-    # Method A: Indexing by class (Type-safe)
-    db[UserFace].insert(user)
+        # Method B: Direct attribute access in lowercase
+        db.productimage.insert(product)
 
-    # Method B: Direct attribute access in lowercase
-    db.productimage.insert(product)
+        # Method C: Auto-routing insert via main db instance
+        db.insert(user)
 
-    # Method C: Auto-routing insert via main db instance
-    db.insert(user)
-
-    print("Insertion complete across all Milvus collections!")
+        print("Insertion complete across all Milvus collections!")
 
 
 if __name__ == "__main__":
