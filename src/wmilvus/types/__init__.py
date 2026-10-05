@@ -1,22 +1,26 @@
-"""Milvus collection schema definitions and vector metadata models."""
+"""Milvus entity models and similarity search types."""
 
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
-class VectorFieldConfig(BaseModel):
-    """Configuration for vector fields in Milvus collections."""
+class VectorRecord(BaseModel):
+    """Data transfer object representing a vector entity for indexing."""
 
-    name: str = Field(default="vector", description="Name of the vector field")
-    dim: int = Field(..., description="Vector dimension")
-    metric_type: str = Field(default="COSINE", description="Metric type (COSINE, L2, IP)")
-    index_type: str = Field(default="HNSW", description="Index type (HNSW, IVF_FLAT, FLAT)")
-    params: Dict[str, Any] = Field(default_factory=lambda: {"M": 16, "efConstruction": 200})
+    id: str = Field(description="Unique identifier for the vector record")
+    vector: List[float] = Field(description="Dense vector embedding representation")
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arbitrary key-value metadata associated with the record",
+    )
 
 
-class SearchResult(BaseModel):
-    """Result item from a vector similarity search."""
+class SearchMatch(BaseModel):
+    """Result item returned from a vector similarity search."""
 
-    id: Any = Field(..., description="Entity ID")
-    distance: float = Field(..., description="Distance / similarity score")
-    entity: Dict[str, Any] = Field(default_factory=dict, description="Retrieved payload fields")
+    id: str = Field(description="Identifier of the matched entity")
+    distance: float = Field(description="Similarity distance score")
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Retrieved entity metadata and attributes",
+    )
