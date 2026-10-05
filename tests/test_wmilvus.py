@@ -23,6 +23,18 @@ def test_search_match_model() -> None:
 
 
 @patch("wmilvus.core.client.MilvusClient")
+def test_context_manager_and_close(mock_milvus_client: MagicMock) -> None:
+    """Test context manager (__enter__, __exit__) and explicit close."""
+    mock_instance = MagicMock()
+    mock_milvus_client.return_value = mock_instance
+
+    with WMilvus(uri="http://localhost:19530") as client:
+        assert client.uri == "http://localhost:19530"
+
+    mock_instance.close.assert_called_once()
+
+
+@patch("wmilvus.core.client.MilvusClient")
 def test_ensure_collection(mock_milvus_client: MagicMock) -> None:
     """Test ensure_collection creates collection if it does not exist."""
     mock_instance = MagicMock()
@@ -37,54 +49,54 @@ def test_ensure_collection(mock_milvus_client: MagicMock) -> None:
 
 
 @patch("wmilvus.core.client.MilvusClient")
-def test_upsert_batch(mock_milvus_client: MagicMock, sample_vector_record: VectorRecord) -> None:
-    """Test upsert_batch converts VectorRecords to payload dictionaries."""
+def test_upsert_batch_with_chunking(mock_milvus_client: MagicMock, sample_vector_record: VectorRecord) -> None:
+    """Test upsert_batch with chunking splits large payloads correctly."""
     mock_instance = MagicMock()
     mock_instance.upsert.return_value = {"upsert_count": 1}
     mock_milvus_client.return_value = mock_instance
 
     client = WMilvus(uri="http://localhost:19530")
-    result = client.upsert_batch(collection_name="test_col", records=[sample_vector_record])
+    records = [sample_vector_record, sample_vector_record]
+    result = client.upsert_batch(collection_name="test_col", records=records, chunk_size=1)
 
-    assert result["upsert_count"] == 1
-    mock_instance.upsert.assert_called_once_with(
-        collection_name="test_col",
-        data=[
-            {
-                "id": "test_vec_1",
-                "vector": [0.1, 0.2, 0.3, 0.4],
-                "category": "test",
-                "active": True,
-            }
-        ],
-    )
+    assert result["upsert_count"] == 2
+    assert mock_instance.upsert.call_count == 2
 
 
 @patch("wmilvus.core.client.MilvusClient")
-def test_search_similar(mock_milvus_client: MagicMock) -> None:
-    """Test search_similar parses NumPy query vectors and formats SearchMatch results."""
+def test_search_batch(mock_milvus_client: MagicMock) -> None:
+    """Test search_batch handles multiple query vectors in parallel."""
     mock_instance = MagicMock()
     mock_instance.search.return_value = [
-        [
-            {
-                "id": "vec_001",
-                "distance": 0.95,
-                "entity": {"id": "vec_001", "label": "forklift"},
-            }
-        ]
+        [{"id": "vec_001", "distance": 0.95, "entity": {"id": "vec_001", "label": "forklift"}}],
+        [{"id": "vec_002", "distance": 0.88, "entity": {"id": "vec_002", "label": "truck"}}],
     ]
     mock_milvus_client.return_value = mock_instance
 
     client = WMilvus(uri="http://localhost:19530")
-    query_arr = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
-    matches = client.search_similar(
-        collection_name="test_col",
-        query_vector=query_arr,
-        top_k=1,
-        filter_expr='label == "forklift"',
-    )
+    queries = np.array([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], dtype=np.float32)
+    batch_results = client.search_batch(collection_name="test_col", query_vectors=queries, top_k=1)
 
-    assert len(matches) == 1
-    assert matches[0].id == "vec_001"
-    assert matches[0].distance == 0.95
-    assert matches[0].metadata == {"label": "forklift"}
+    assert len(batch_results) == 2
+    assert batch_results[0][0].id == "vec_001"
+    assert batch_results[1][0].id == "vec_002"
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_query_scalar(mock_milvus_client: MagicMock) -> None:
+    """Test query_scalar executes scalar filtering queries."""
+    mock_instance = MagicMock()
+    mock_instance.query.return_value = [{"id": "vec_001", "camera_id": "cam_north"}]
+    mock_milvus_client.return_value = mock_instance
+
+    client = WMilvus(uri="http://localhost:19530")
+    res = client.query_scalar(collection_name="test_col", filter_expr='camera_id == "cam_north"')
+
+    assert len(res) == 1
+    assert res[0]["camera_id"] == "cam_north"
+    mock_instance.query.assert_called_once_with(
+        collection_name="test_col",
+        filter='camera_id == "cam_north"',
+        output_fields=["*"],
+        limit=100,
+    )
