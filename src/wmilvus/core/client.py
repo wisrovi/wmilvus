@@ -216,6 +216,31 @@ class CollectionRepository:
                 results.append(self.model_cls.model_validate(obj_data))
         return results
 
+    def search_similar_with_scores(
+        self,
+        vector: Union[List[float], np.ndarray],
+        top_k: int = 5,
+        filter_expr: str = "",
+    ) -> List[SearchMatch]:
+        """Perform vector similarity search returning SearchMatch instances with similarity scores."""
+        vec_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
+        search_output = self.client.search(
+            collection_name=self.collection_name,
+            data=[vec_list],
+            limit=top_k,
+            filter=filter_expr,
+            output_fields=["*"],
+        )
+        results: List[SearchMatch] = []
+        if search_output and len(search_output) > 0:
+            for item in search_output[0]:
+                entity = item.get("entity", {})
+                distance = float(item.get("distance", 0.0))
+                rec_id = str(item.get("id", entity.get("id", "")))
+                metadata = {k: v for k, v in entity.items() if k != "vector"}
+                results.append(SearchMatch(id=rec_id, distance=distance, metadata=metadata))
+        return results
+
     def update(self, record_id: str, record: BaseModel, user_id: Optional[int] = None) -> BaseModel:
         """Update existing record in Milvus collection with forensic audit logging."""
         before_item = self.get_by_field(id=record_id)
@@ -380,6 +405,17 @@ class WMilvus:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_similar(vector=vector, top_k=top_k, filter_expr=filter_expr)
         raise CollectionError("search_similar() on main WMilvus instance is only valid in single-collection mode")
+
+    def search_similar_with_scores(
+        self,
+        vector: Union[List[float], np.ndarray],
+        top_k: int = 5,
+        filter_expr: str = "",
+    ) -> List[SearchMatch]:
+        if len(self.repositories) == 1:
+            single_repo = next(iter(self.repositories.values()))
+            return single_repo.search_similar_with_scores(vector=vector, top_k=top_k, filter_expr=filter_expr)
+        raise CollectionError("search_similar_with_scores() on main WMilvus instance is only valid in single-collection mode")
 
     def update(self, record_id: str, record: BaseModel, user_id: Optional[int] = None) -> BaseModel:
         model_cls = record.__class__
