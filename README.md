@@ -12,14 +12,15 @@
     </a>
 </p>
 
-**wmilvus** is an enterprise-grade, type-safe Milvus Vector Database client and wrapper that leverages Pydantic models for schema definitions, collection auto-creation, index configuration, and vector similarity search.
+**wmilvus** is an enterprise-grade, type-safe Milvus Vector Database client wrapper designed for simplified pipeline usage, batch vector operations, and metadata querying.
 
 ## Key Features
 
-- **Pydantic Integration** — Map vector collection metadata and payload entities using Pydantic models.
-- **Type-Safe Search** — High-level, type-safe API for vector insertion, collection management, and top-k similarity queries.
-- **Auto Indexing** — Declarative configuration of vector dimensions and indexing parameters (`HNSW`, `IVF_FLAT`, `FLAT`).
-- **Connection Management** — Handles lifecycle and parameters for Milvus server / cluster connections seamlessly.
+- **Pydantic Data Models** — Typed data transfer objects (`VectorRecord`, `SearchMatch`) for vector entities and metadata.
+- **Batch Vector Operations** — High-performance single and batch vector similarity searches (`search_similar`, `search_batch`).
+- **Resilient Batch Upserting** — Automatic payload chunking (`chunk_size=1000`) for large-scale embedding ingestion.
+- **Scalar Metadata Queries** — Filter vector entities by boolean scalar expressions (`query_scalar`) without requiring vector search.
+- **Context Manager Support** — Clean resource cleanup using Python `with` statements or explicit `.close()`.
 
 ## Technical Stack
 
@@ -29,6 +30,7 @@
 | Vector Engine | Milvus 2.3+ |
 | SDK Core | pymilvus 2.3+ |
 | Validation | Pydantic 2.x |
+| Numerical Core | NumPy |
 | Logging | Loguru |
 | CLI | Click |
 | Testing | pytest, pytest-cov |
@@ -37,15 +39,39 @@
 ## Quick Start
 
 ```python
-from pydantic import BaseModel
-from wmilvus import WMilvus, VectorFieldConfig
+import numpy as np
+from wmilvus import WMilvus, VectorRecord
 
-class ImageVector(BaseModel):
-    image_id: str
-    description: str
+# Initialize client using context manager
+with WMilvus(uri="http://localhost:19530") as milvus:
+    # 1. Ensure collection exists
+    milvus.ensure_collection(collection_name="visual_embeddings", dimension=512, metric_type="COSINE")
 
-config = VectorFieldConfig(dim=128, metric_type="COSINE", index_type="HNSW")
-client = WMilvus(model_class=ImageVector, vector_config=config, host="localhost", port=19530)
+    # 2. Upsert batch of vector records
+    sample_vector = np.random.rand(512).astype(np.float32).tolist()
+    records = [
+        VectorRecord(
+            id="frame_00104",
+            vector=sample_vector,
+            metadata={"camera_id": "cam_entry_north", "label": "forklift"},
+        )
+    ]
+    milvus.upsert_batch(collection_name="visual_embeddings", records=records)
+
+    # 3. Perform single vector similarity search
+    query = np.random.rand(512).astype(np.float32)
+    matches = milvus.search_similar(
+        collection_name="visual_embeddings",
+        query_vector=query,
+        top_k=3,
+        filter_expr='label == "forklift"',
+    )
+
+    # 4. Perform scalar metadata query
+    items = milvus.query_scalar(
+        collection_name="visual_embeddings",
+        filter_expr='camera_id == "cam_entry_north"',
+    )
 ```
 
 ## Running Tests
