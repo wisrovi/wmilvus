@@ -14,6 +14,7 @@ from wmilvus.exceptions import (
     WMilvusError,
 )
 from wmilvus.integrations.wpipe import WMilvusIngestStep
+from wmilvus.integrations.wsqlite import export_to_sqlite, import_from_sqlite
 from wmilvus.types import (
     FieldVector,
     ForensicModel,
@@ -24,7 +25,7 @@ from wmilvus.types import (
     normalize_vector,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "WMilvus",
@@ -39,6 +40,8 @@ __all__ = [
     "SearchMatch",
     "normalize_vector",
     "WMilvusIngestStep",
+    "export_to_sqlite",
+    "import_from_sqlite",
     "WMilvusError",
     "ConnectionError",
     "CollectionError",
