@@ -1,5 +1,6 @@
 """Comprehensive unit tests for WMilvus Pydantic ORM (Single, Multi-Collection, Batch, Range, Hybrid, Schema, and Async)."""
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from pydantic import BaseModel
@@ -310,3 +311,38 @@ def test_wpipe_ingest_step(mock_milvus_client: MagicMock) -> None:
     result = step.process([person])
     assert result["status"] == "SUCCESS"
     assert result["inserted_count"] == 1
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_wsqlite_export_import_flow(mock_milvus_client: MagicMock, tmp_path: Any) -> None:
+    """Test export_to_sqlite and import_from_sqlite backup integration."""
+    from wmilvus.integrations.wsqlite import export_to_sqlite, import_from_sqlite
+
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = [
+        {"id": "sq1", "name": "Backup User", "age": 35, "is_active": True, "vector": [0.1, 0.2, 0.3, 0.4]}
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    db.get_all = MagicMock(
+        return_value=[
+            Person(id="sq1", name="Backup User", age=35, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4])
+        ]
+    )
+
+    sqlite_file = str(tmp_path / "wmilvus_backup.db")
+
+    # 1. Export
+    exp_res = export_to_sqlite(db, Person, sqlite_file)
+    assert exp_res["exported_count"] == 1
+    assert exp_res["sqlite_path"] == sqlite_file
+
+    # 2. Import
+    imp_res = import_from_sqlite(db, Person, sqlite_file)
+    assert imp_res["imported_count"] == 1
+    assert imp_res["status"] == "SUCCESS"
+
