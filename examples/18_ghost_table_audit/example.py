@@ -44,25 +44,24 @@ def inspect_ghost_audit_log(db: WMilvus) -> None:
 def main() -> None:
     print("--- Enterprise Ghost Collection Audit Trail Demonstration in WMilvus ---")
 
-    # 1. Initialize WMilvus with a ForensicModel
-    db = WMilvus(BankAccountVector, milvus_config)
+    # 1. Initialize WMilvus with a ForensicModel using context manager
+    with WMilvus(BankAccountVector, milvus_config) as db:
+        # 2. Perform INSERT with User ID=100
+        print("\n1. Inserting Bank Account (User ID = 100)...")
+        account = BankAccountVector(id="1", holder_name="William Rodriguez", balance=15000.00, account_vec=[0.1] * 128)
+        db.insert(account, user_id=100)
 
-    # 2. Perform INSERT with User ID=100
-    print("\n1. Inserting Bank Account (User ID = 100)...")
-    account = BankAccountVector(id="1", holder_name="William Rodriguez", balance=15000.00, account_vec=[0.1] * 128)
-    db.insert(account, user_id=100)
+        # 3. Perform UPDATE with User ID=200
+        print("\n2. Updating Balance (User ID = 200)...")
+        updated_account = BankAccountVector(id="1", holder_name="William Rodriguez", balance=18500.50, account_vec=[0.1] * 128)
+        db.update("1", updated_account, user_id=200)
 
-    # 3. Perform UPDATE with User ID=200
-    print("\n2. Updating Balance (User ID = 200)...")
-    updated_account = BankAccountVector(id="1", holder_name="William Rodriguez", balance=18500.50, account_vec=[0.1] * 128)
-    db.update("1", updated_account, user_id=200)
+        # 4. Perform DELETE with User ID=999
+        print("\n3. Deleting Account (User ID = 999)...")
+        db.delete("1", user_id=999)
 
-    # 4. Perform DELETE with User ID=999
-    print("\n3. Deleting Account (User ID = 999)...")
-    db.delete("1", user_id=999)
-
-    # 5. Inspect recorded audit trail via ORM API
-    inspect_ghost_audit_log(db)
+        # 5. Inspect recorded audit trail via ORM API
+        inspect_ghost_audit_log(db)
 
 
 if __name__ == "__main__":
