@@ -12,15 +12,15 @@
     </a>
 </p>
 
-**wmilvus** is an enterprise-grade, type-safe Milvus Vector Database client wrapper designed for simplified pipeline usage, batch vector operations, and metadata querying.
+**wmilvus** is an enterprise-grade, type-safe Milvus Vector Database client wrapper for Python designed with high-level Pydantic ORM model mapping, vector search, multi-collection routing, and audit trail support.
 
 ## Key Features
 
-- **Pydantic Data Models** — Typed data transfer objects (`VectorRecord`, `SearchMatch`) for vector entities and metadata.
-- **Batch Vector Operations** — High-performance single and batch vector similarity searches (`search_similar`, `search_batch`).
-- **Resilient Batch Upserting** — Automatic payload chunking (`chunk_size=1000`) for large-scale embedding ingestion.
-- **Scalar Metadata Queries** — Filter vector entities by boolean scalar expressions (`query_scalar`) without requiring vector search.
-- **Context Manager Support** — Clean resource cleanup using Python `with` statements or explicit `.close()`.
+- **Pydantic Model Declarations** — Define collections as standard Pydantic models with vector annotations (`FieldVector`).
+- **Vector Similarity Search (KNN/ANN)** — High-performance vector similarity search returning typed Pydantic models (`search_similar`) or search matches with similarity distance scores (`search_similar_with_scores`).
+- **Single & Multi-Collection ORM Routing** — Automatic collection creation and routing by model class (`db[Model]`), attribute (`db.modelname`), or main client auto-routing (`db.insert(instance)`).
+- **Enterprise Ghost Audit Log (`_forensic_audit_log`)** — Global audit trail tracking `INSERT`, `UPDATE`, `SOFT_DELETE`, and `HARD_DELETE` operations for models inheriting from `ForensicModel`.
+- **Dockerized Test Runner & Coverage** — Out-of-the-box support for isolated container testing (`run_tests_docker.sh`) and HTML coverage reports (`run_coverage.sh`).
 
 ## Technical Stack
 
@@ -29,60 +29,59 @@
 | Language | Python 3.9+ |
 | Vector Engine | Milvus 2.3+ |
 | SDK Core | pymilvus 2.3+ |
-| Validation | Pydantic 2.x |
-| Numerical Core | NumPy |
+| Data Validation | Pydantic 2.x |
+| Numerical Operations | NumPy |
 | Logging | Loguru |
-| CLI | Click |
-| Testing | pytest, pytest-cov |
-| Linting | ruff |
+| CLI Framework | Click |
+| Testing Framework | pytest, pytest-cov |
 
 ## Quick Start
 
 ```python
-import numpy as np
-from wmilvus import WMilvus, VectorRecord
+from typing import List
+from pydantic import BaseModel
+from wmilvus import FieldVector, WMilvus
 
-# Initialize client using context manager
-with WMilvus(uri="http://localhost:19530") as milvus:
-    # 1. Ensure collection exists
-    milvus.ensure_collection(collection_name="visual_embeddings", dimension=512, metric_type="COSINE")
+class UserFace(BaseModel):
+    id: str
+    name: str
+    face_embedding: List[float] = FieldVector(dim=128, metric_type="COSINE")
 
-    # 2. Upsert batch of vector records
-    sample_vector = np.random.rand(512).astype(np.float32).tolist()
-    records = [
-        VectorRecord(
-            id="frame_00104",
-            vector=sample_vector,
-            metadata={"camera_id": "cam_entry_north", "label": "forklift"},
-        )
-    ]
-    milvus.upsert_batch(collection_name="visual_embeddings", records=records)
+# Initialize WMilvus ORM
+db = WMilvus(UserFace, uri="http://localhost:19530")
 
-    # 3. Perform single vector similarity search
-    query = np.random.rand(512).astype(np.float32)
-    matches = milvus.search_similar(
-        collection_name="visual_embeddings",
-        query_vector=query,
-        top_k=3,
-        filter_expr='label == "forklift"',
-    )
+# 1. Insert Pydantic record
+user = UserFace(id="u_001", name="William Rodriguez", face_embedding=[0.1] * 128)
+db.insert(user)
 
-    # 4. Perform scalar metadata query
-    items = milvus.query_scalar(
-        collection_name="visual_embeddings",
-        filter_expr='camera_id == "cam_entry_north"',
-    )
+# 2. Vector Similarity Search returning typed Pydantic instances
+matches = db.search_similar(vector=[0.1] * 128, top_k=5)
+print(f"Top match: {matches[0].name}")
+
+# 3. Vector Search with Similarity Scores
+matches_with_scores = db.search_similar_with_scores(vector=[0.1] * 128, top_k=5)
+print(f"Score: {matches_with_scores[0].distance:.4f}")
 ```
+
+## Organized Examples
+
+The repository includes organized example scripts in `examples/`:
+
+- [`examples/01_crud/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/01_crud/example.py) — Single-collection CRUD operations.
+- [`examples/02_vector_search/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/02_vector_search/example.py) — Vector similarity KNN search, distance scores, and scalar metadata filtering.
+- [`examples/16_forensic_fields/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/16_forensic_fields/example.py) — Forensic field tracking (`create_by`, `create_in`, `update_by`).
+- [`examples/17_multi_table/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/17_multi_table/example.py) — Multi-collection management & repository routing.
+- [`examples/18_ghost_table_audit/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/18_ghost_table_audit/example.py) — Enterprise global audit trail (`_forensic_audit_log`).
 
 ## Running Tests
 
-Execute tests in an isolated Docker container:
+Execute unit tests inside an isolated Docker container:
 
 ```bash
 ./run_tests_docker.sh
 ```
 
-Calculate code coverage:
+Calculate code coverage locally:
 
 ```bash
 ./run_coverage.sh
