@@ -86,8 +86,8 @@ def record_ghost_audit(
         "action_type": action_type,
         "table_name": table_name,
         "record_id": str(record_id),
-        "data_before": json.dumps(data_before) if data_before else "",
-        "data_after": json.dumps(data_after) if data_after else "",
+        "data_before": json.dumps(data_before, default=str) if data_before else "",
+        "data_after": json.dumps(data_after, default=str) if data_after else "",
         "create_by": user_id or 1,
         "create_in": now_str,
     }
