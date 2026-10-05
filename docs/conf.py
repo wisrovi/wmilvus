@@ -1,6 +1,10 @@
+"""Sphinx configuration file for wmilvus documentation."""
+
+# ruff: noqa
 import os
 import sys
 from datetime import datetime
+
 
 # Insert src into sys.path for autodoc
 sys.path.insert(0, os.path.abspath("../src"))
