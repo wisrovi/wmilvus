@@ -1,7 +1,6 @@
-"""WMilvus - Milvus Vector Database Client using Pydantic models."""
+"""WMilvus - Simplified and resilient Milvus client wrapper for vector operations."""
 
 from wmilvus.core.client import WMilvus
-from wmilvus.core.connection import ConnectionManager
 from wmilvus.exceptions import (
     CollectionError,
     ConnectionError,
@@ -9,15 +8,14 @@ from wmilvus.exceptions import (
     VectorSearchError,
     WMilvusError,
 )
-from wmilvus.types import SearchResult, VectorFieldConfig
+from wmilvus.types import SearchMatch, VectorRecord
 
 __version__ = "0.1.0"
 
 __all__ = [
     "WMilvus",
-    "ConnectionManager",
-    "VectorFieldConfig",
-    "SearchResult",
+    "VectorRecord",
+    "SearchMatch",
     "WMilvusError",
     "ConnectionError",
     "CollectionError",
