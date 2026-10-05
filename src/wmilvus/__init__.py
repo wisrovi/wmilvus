@@ -13,6 +13,7 @@ from wmilvus.exceptions import (
     VectorSearchError,
     WMilvusError,
 )
+from wmilvus.integrations.wpipe import WMilvusIngestStep
 from wmilvus.types import (
     FieldVector,
     ForensicModel,
@@ -20,9 +21,10 @@ from wmilvus.types import (
     MetricType,
     SearchMatch,
     VectorRecord,
+    normalize_vector,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "WMilvus",
@@ -35,6 +37,8 @@ __all__ = [
     "ForensicModel",
     "VectorRecord",
     "SearchMatch",
+    "normalize_vector",
+    "WMilvusIngestStep",
     "WMilvusError",
     "ConnectionError",
     "CollectionError",
