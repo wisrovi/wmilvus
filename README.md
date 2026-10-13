@@ -17,12 +17,17 @@
 ## Key Features
 
 - **Pydantic Model Declarations** — Define collections as standard Pydantic models with vector annotations (`FieldVector`, `MetricType`, `IndexType`).
-- **Vector Similarity & Range Search** — KNN similarity search (`search_similar`), similarity distance scores (`search_similar_with_scores`), and similarity range threshold search (`search_range`).
-- **Universal Primary Key Support** — Full compatibility with both `INT64` (auto-increment) and `VARCHAR` primary keys in `get_all()`, `get_by_field()`, and audit queries.
-- **Bulk Vector Ingestion** — High-performance chunked bulk insertion (`insert_batch`) with configurable payload size limits.
-- **Async Client Support (`AsyncWMilvus`)** — Non-blocking async client with `async with` context manager for FastAPI and asyncio applications.
+- **Dynamic Vector Fields & Auto-ID** — Native payload generation supporting custom vector attribute names (`embedding`, `face_vec`, etc.) and automated `INT64` primary key generation without requiring manual IDs.
+- **Universal Primary Key Support** — Full compatibility with both auto-increment integer (`INT64`) and string (`VARCHAR`) primary keys across all CRUD, filtering, and search routines.
+- **Collection Partitioning & Multi-Tenancy** — Route insertions, queries, and searches to specific Milvus partitions (`partition_name` / `partition_names`).
+- **High-Scale Streaming Iterators (`iter_all`)** — Memory-efficient batch streaming across millions of vectors using native Milvus query iterators.
+- **Typed Filter Query Builder (`filter_by`)** — Declarative keyword querying with comparison operators (`age__gte=18`, `status__in=[1, 2]`, `dni='00000000P'`).
+- **Vector Similarity & Range Search** — KNN similarity search (`search_similar`), similarity distance scores (`search_similar_with_scores`), and similarity range threshold search (`search_range`) with customizable search index parameters (`search_params`).
+- **Batch & Expression Deletion** — Flexible record removal via single ID (`delete`), batch IDs (`delete_batch`), or scalar filter expressions (`delete_by_expr`).
+- **Multi-Vector & Hybrid Search Rankers** — Dense + scalar hybrid search with direct support for Milvus rerankers (`RRFRanker`, `WeightedRanker`).
+- **Bulk Vector Ingestion** — High-performance chunked bulk insertion (`insert_batch`) with automatic payload chunking and ID propagation.
+- **Async Client Support (`AsyncWMilvus`)** — Full non-blocking async mirror with `async with` context manager for FastAPI and asyncio applications.
 - **Schema Verification (`verify_schema`)** — Verification of Pydantic model vector dimensions against active Milvus collection schemas.
-- **Hybrid Search (`search_hybrid`)** — Multi-modal search combining dense vector embeddings with text/scalar metadata filter expressions.
 - **Single & Multi-Collection ORM Routing** — Automatic collection creation and routing by model class (`db[Model]`), attribute (`db.modelname`), or main client auto-routing (`db.insert(instance)`).
 - **Enterprise Ghost Audit Log (`_forensic_audit_log`)** — Global audit trail tracking `INSERT`, `UPDATE`, `SOFT_DELETE`, and `HARD_DELETE` operations for models inheriting from `ForensicModel`.
 - **SQLite Vector Backup & Import (`wsqlite`)** — Native ORM-based backup export (`export_to_sqlite`) and restoration (`import_from_sqlite`) powered by `wsqlite`.
