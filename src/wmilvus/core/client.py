@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any, Optional, Union
 
@@ -45,6 +46,66 @@ def inspect_model_vector_field(model_cls: type[BaseModel]) -> dict[str, Any]:
         "index_type": "HNSW",
         "params": {"M": 16, "efConstruction": 200},
     }
+
+
+def inspect_model_pk_field(model_cls: type[BaseModel]) -> dict[str, Any]:
+    """Inspect model to identify primary key field name, whether it is integer, and auto_id preference."""
+    fields = model_cls.model_fields
+    if "id" in fields:
+        field_info = fields["id"]
+        annotation = field_info.annotation
+        import typing
+
+        origin = typing.get_origin(annotation)
+        args = typing.get_args(annotation)
+        is_int = annotation is int or (origin is typing.Union and int in args)
+        return {
+            "name": "id",
+            "is_int": is_int,
+            "auto_id": is_int or field_info.default is None,
+        }
+    return {"name": "id", "is_int": False, "auto_id": False}
+
+
+def build_filter_expr(filter_kwargs: dict[str, Any]) -> str:
+    """Translate dictionary or keyword arguments into Milvus filter expressions."""
+    if not filter_kwargs:
+        return ""
+    clauses = []
+    for raw_key, val in filter_kwargs.items():
+        if "__" in raw_key:
+            field_name, op = raw_key.split("__", 1)
+        else:
+            field_name, op = raw_key, "eq"
+
+        if op == "eq":
+            clause = (
+                f'{field_name} == "{val}"' if isinstance(val, str) else f"{field_name} == {val}"
+            )
+        elif op == "ne":
+            clause = (
+                f'{field_name} != "{val}"' if isinstance(val, str) else f"{field_name} != {val}"
+            )
+        elif op == "gt":
+            clause = f"{field_name} > {val}"
+        elif op == "gte":
+            clause = f"{field_name} >= {val}"
+        elif op == "lt":
+            clause = f"{field_name} < {val}"
+        elif op == "lte":
+            clause = f"{field_name} <= {val}"
+        elif op == "like":
+            clause = f'{field_name} like "{val}"'
+        elif op == "in" and isinstance(val, (list, tuple, set)):
+            formatted_vals = [f'"{v}"' if isinstance(v, str) else str(v) for v in val]
+            clause = f"{field_name} in [{', '.join(formatted_vals)}]"
+        else:
+            clause = (
+                f'{field_name} == "{val}"' if isinstance(val, str) else f"{field_name} == {val}"
+            )
+        clauses.append(clause)
+
+    return " and ".join(clauses)
 
 
 def ensure_ghost_audit_log_collection(client: MilvusClient) -> None:
@@ -100,19 +161,71 @@ class CollectionRepository:
 
     def _ensure_collection(self) -> None:
         if not self.client.has_collection(collection_name=self.collection_name):
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                dimension=self.vector_meta["dim"],
-                metric_type=self.vector_meta["metric_type"],
-                auto_id=False,
-                id_type=DataType.VARCHAR,
-                max_length=64,
-            )
-            logger.info(
-                f"Created collection '{self.collection_name}' for model {self.model_cls.__name__}"
-            )
+            pk_info = inspect_model_pk_field(self.model_cls)
+            id_type = DataType.INT64 if pk_info["is_int"] else DataType.VARCHAR
+            auto_id = pk_info["auto_id"]
+            vector_field_name = self.vector_meta["field_name"]
 
-    def insert(self, record: BaseModel, user_id: Optional[int] = 1) -> BaseModel:
+            try:
+                schema = self.client.create_schema(
+                    auto_id=auto_id,
+                    enable_dynamic_field=True,
+                )
+                if pk_info["is_int"]:
+                    schema.add_field(
+                        field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=auto_id
+                    )
+                else:
+                    schema.add_field(
+                        field_name="id",
+                        datatype=DataType.VARCHAR,
+                        is_primary=True,
+                        max_length=64,
+                        auto_id=auto_id,
+                    )
+
+                schema.add_field(
+                    field_name=vector_field_name,
+                    datatype=DataType.FLOAT_VECTOR,
+                    dim=self.vector_meta["dim"],
+                )
+
+                index_params = self.client.prepare_index_params()
+                index_params.add_index(
+                    field_name=vector_field_name,
+                    index_type=self.vector_meta["index_type"],
+                    metric_type=self.vector_meta["metric_type"],
+                    params=self.vector_meta.get("params", {"M": 16, "efConstruction": 200}),
+                )
+
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    schema=schema,
+                    index_params=index_params,
+                )
+                logger.info(
+                    f"Created collection '{self.collection_name}' with explicit schema for model {self.model_cls.__name__}"
+                )
+            except Exception as e:
+                logger.debug(f"Explicit schema creation fallback: {e}")
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    dimension=self.vector_meta["dim"],
+                    metric_type=self.vector_meta["metric_type"],
+                    auto_id=auto_id,
+                    id_type=id_type,
+                    max_length=64,
+                )
+                logger.info(
+                    f"Created collection '{self.collection_name}' for model {self.model_cls.__name__}"
+                )
+
+    def insert(
+        self,
+        record: BaseModel,
+        user_id: Optional[int] = 1,
+        partition_name: Optional[str] = None,
+    ) -> BaseModel:
         """Insert a single typed Pydantic model instance into Milvus with forensic audit logging."""
         data_dict = record.model_dump()
         vector_field_name = self.vector_meta["field_name"]
@@ -120,13 +233,32 @@ class CollectionRepository:
             data_dict["create_by"] = user_id
             data_dict["create_in"] = datetime.now(timezone.utc).isoformat()
 
-        rec_id = str(data_dict.get("id", ""))
+        rec_id = data_dict.get("id")
+        has_id = rec_id is not None and rec_id != ""
+
         payload = {
-            "id": rec_id,
-            "vector": data_dict[vector_field_name],
+            vector_field_name: data_dict[vector_field_name],
             **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
         }
-        self.client.upsert(collection_name=self.collection_name, data=[payload])
+        if has_id:
+            payload["id"] = rec_id
+
+        kwargs: dict[str, Any] = {}
+        if partition_name:
+            kwargs["partition_name"] = partition_name
+
+        if has_id:
+            self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
+        else:
+            insert_res = self.client.insert(
+                collection_name=self.collection_name, data=[payload], **kwargs
+            )
+            if isinstance(insert_res, dict) and insert_res.get("ids"):
+                generated_id = insert_res["ids"][0]
+                if hasattr(record, "id"):
+                    record.id = generated_id
+                rec_id = generated_id
+
         with contextlib.suppress(Exception):
             self.client.flush(collection_name=self.collection_name)
 
@@ -135,7 +267,7 @@ class CollectionRepository:
                 client=self.client,
                 action_type="INSERT",
                 table_name=self.collection_name,
-                record_id=rec_id,
+                record_id=str(rec_id or ""),
                 data_after={k: v for k, v in data_dict.items() if k != vector_field_name},
                 user_id=user_id,
             )
@@ -146,6 +278,7 @@ class CollectionRepository:
         records: list[BaseModel],
         batch_size: int = 1000,
         user_id: Optional[int] = 1,
+        partition_name: Optional[str] = None,
     ) -> dict[str, Any]:
         """Perform bulk insertion of vector records in configurable batch chunks."""
         if not records:
@@ -155,23 +288,46 @@ class CollectionRepository:
         total_records = len(records)
         batches_processed = 0
 
+        kwargs: dict[str, Any] = {}
+        if partition_name:
+            kwargs["partition_name"] = partition_name
+
         for i in range(0, total_records, batch_size):
             chunk = records[i : i + batch_size]
             payload_batch = []
+            has_ids = True
+
             for record in chunk:
                 data_dict = record.model_dump()
                 if self.forensic and user_id is not None:
                     data_dict["create_by"] = user_id
                     data_dict["create_in"] = datetime.now(timezone.utc).isoformat()
-                rec_id = str(data_dict.get("id", ""))
+                rec_id = data_dict.get("id")
+                rec_has_id = rec_id is not None and rec_id != ""
+                if not rec_has_id:
+                    has_ids = False
+
                 payload = {
-                    "id": rec_id,
-                    "vector": data_dict[vector_field_name],
+                    vector_field_name: data_dict[vector_field_name],
                     **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
                 }
+                if rec_has_id:
+                    payload["id"] = rec_id
                 payload_batch.append(payload)
 
-            self.client.upsert(collection_name=self.collection_name, data=payload_batch)
+            if has_ids:
+                self.client.upsert(
+                    collection_name=self.collection_name, data=payload_batch, **kwargs
+                )
+            else:
+                res = self.client.insert(
+                    collection_name=self.collection_name, data=payload_batch, **kwargs
+                )
+                if isinstance(res, dict) and res.get("ids"):
+                    for rec, gid in zip(chunk, res["ids"]):
+                        if hasattr(rec, "id"):
+                            rec.id = gid
+
             batches_processed += 1
             logger.info(
                 f"Inserted batch {batches_processed} ({len(chunk)} records) into '{self.collection_name}'"
@@ -192,13 +348,22 @@ class CollectionRepository:
 
         return {"inserted_count": total_records, "batches_processed": batches_processed}
 
-    def get_all(self, limit: int = 100) -> list[BaseModel]:
+    def get_all(
+        self,
+        limit: int = 100,
+        partition_names: Optional[list[str]] = None,
+    ) -> list[BaseModel]:
         """Query all records from the collection up to the specified limit."""
+        kwargs: dict[str, Any] = {}
+        if partition_names:
+            kwargs["partition_names"] = partition_names
+
         raw_items = self.client.query(
             collection_name=self.collection_name,
             filter="",
             output_fields=["*"],
             limit=limit,
+            **kwargs,
         )
         vector_field_name = self.vector_meta["field_name"]
         results: list[BaseModel] = []
@@ -209,7 +374,11 @@ class CollectionRepository:
             results.append(self.model_cls.model_validate(obj_data))
         return results
 
-    def get_by_field(self, **kwargs: Any) -> Optional[BaseModel]:
+    def get_by_field(
+        self,
+        partition_names: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> Optional[BaseModel]:
         """Fetch a single record matching scalar field kwargs."""
         if not kwargs:
             return None
@@ -219,11 +388,16 @@ class CollectionRepository:
             if isinstance(field_value, str)
             else f"{field_name} == {field_value}"
         )
+        extra_kwargs: dict[str, Any] = {}
+        if partition_names:
+            extra_kwargs["partition_names"] = partition_names
+
         raw_items = self.client.query(
             collection_name=self.collection_name,
             filter=filter_expr,
             output_fields=["*"],
             limit=1,
+            **extra_kwargs,
         )
         if not raw_items:
             return None
@@ -234,22 +408,94 @@ class CollectionRepository:
             obj_data[vector_field_name] = item["vector"]
         return self.model_cls.model_validate(obj_data)
 
+    def filter_by(
+        self,
+        limit: int = 100,
+        partition_names: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> list[BaseModel]:
+        """Query records using typed keyword arguments (e.g. name='Alice', age__gte=18)."""
+        filter_expr = build_filter_expr(kwargs)
+        extra_kwargs: dict[str, Any] = {}
+        if partition_names:
+            extra_kwargs["partition_names"] = partition_names
+
+        raw_items = self.client.query(
+            collection_name=self.collection_name,
+            filter=filter_expr,
+            output_fields=["*"],
+            limit=limit,
+            **extra_kwargs,
+        )
+        vector_field_name = self.vector_meta["field_name"]
+        results: list[BaseModel] = []
+        for item in raw_items:
+            obj_data = {k: v for k, v in item.items() if k != "vector"}
+            if "vector" in item:
+                obj_data[vector_field_name] = item["vector"]
+            results.append(self.model_cls.model_validate(obj_data))
+        return results
+
+    def iter_all(
+        self,
+        batch_size: int = 1000,
+        filter_expr: str = "",
+        partition_names: Optional[list[str]] = None,
+    ) -> Iterator[list[BaseModel]]:
+        """Yield batches of typed Pydantic models using native Milvus query iterator."""
+        vector_field_name = self.vector_meta["field_name"]
+        kwargs: dict[str, Any] = {}
+        if partition_names:
+            kwargs["partition_names"] = partition_names
+
+        iterator = self.client.query_iterator(
+            collection_name=self.collection_name,
+            batch_size=batch_size,
+            filter=filter_expr,
+            output_fields=["*"],
+            **kwargs,
+        )
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                results = []
+                for item in batch:
+                    obj_data = {k: v for k, v in item.items() if k != "vector"}
+                    if "vector" in item:
+                        obj_data[vector_field_name] = item["vector"]
+                    results.append(self.model_cls.model_validate(obj_data))
+                yield results
+        finally:
+            iterator.close()
+
     def search_similar(
         self,
         vector: Union[list[float], np.ndarray],
         top_k: int = 5,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         """Perform vector similarity search returning typed Pydantic model instances."""
         vec_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
+        vector_field_name = self.vector_meta["field_name"]
+        kwargs: dict[str, Any] = {}
+        if search_params:
+            kwargs["search_params"] = search_params
+        if partition_names:
+            kwargs["partition_names"] = partition_names
+
         search_output = self.client.search(
             collection_name=self.collection_name,
             data=[vec_list],
             limit=top_k,
             filter=filter_expr,
             output_fields=["*"],
+            anns_field=vector_field_name,
+            **kwargs,
         )
-        vector_field_name = self.vector_meta["field_name"]
         results: list[BaseModel] = []
         if search_output and len(search_output) > 0:
             for item in search_output[0]:
@@ -265,15 +511,26 @@ class CollectionRepository:
         vector: Union[list[float], np.ndarray],
         top_k: int = 5,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         """Perform vector similarity search returning SearchMatch instances with similarity scores."""
         vec_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
+        vector_field_name = self.vector_meta["field_name"]
+        kwargs: dict[str, Any] = {}
+        if search_params:
+            kwargs["search_params"] = search_params
+        if partition_names:
+            kwargs["partition_names"] = partition_names
+
         search_output = self.client.search(
             collection_name=self.collection_name,
             data=[vec_list],
             limit=top_k,
             filter=filter_expr,
             output_fields=["*"],
+            anns_field=vector_field_name,
+            **kwargs,
         )
         results: list[SearchMatch] = []
         if search_output and len(search_output) > 0:
@@ -291,14 +548,21 @@ class CollectionRepository:
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         """Perform vector similarity range search filtering by minimum similarity score / radius threshold."""
         matches_scores = self.search_range_with_scores(
-            vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+            vector=vector,
+            radius=radius,
+            top_k=top_k,
+            filter_expr=filter_expr,
+            search_params=search_params,
+            partition_names=partition_names,
         )
         results: list[BaseModel] = []
         for match in matches_scores:
-            rec = self.get_by_field(id=match.id)
+            rec = self.get_by_field(id=match.id, partition_names=partition_names)
             if rec:
                 results.append(rec)
         return results
@@ -309,10 +573,16 @@ class CollectionRepository:
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         """Perform vector similarity range search returning SearchMatch items above radius score."""
         all_matches = self.search_similar_with_scores(
-            vector=vector, top_k=top_k, filter_expr=filter_expr
+            vector=vector,
+            top_k=top_k,
+            filter_expr=filter_expr,
+            search_params=search_params,
+            partition_names=partition_names,
         )
         return [m for m in all_matches if m.distance >= radius]
 
@@ -323,6 +593,9 @@ class CollectionRepository:
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
+        ranker: Optional[Any] = None,
     ) -> list[BaseModel]:
         """Perform hybrid similarity search combining dense vector search with text/scalar filtering expressions."""
         combined_filter = filter_expr
@@ -330,7 +603,13 @@ class CollectionRepository:
             text_expr = f'{text_field} like "%{text_query}%"'
             combined_filter = f"({filter_expr}) and ({text_expr})" if filter_expr else text_expr
 
-        return self.search_similar(vector=vector, top_k=top_k, filter_expr=combined_filter)
+        return self.search_similar(
+            vector=vector,
+            top_k=top_k,
+            filter_expr=combined_filter,
+            search_params=search_params,
+            partition_names=partition_names,
+        )
 
     def verify_schema(self) -> dict[str, Any]:
         """Verify that the Milvus collection schema matches the bound Pydantic model definition."""
@@ -372,9 +651,17 @@ class CollectionRepository:
             "field_count": len(fields),
         }
 
-    def update(self, record_id: str, record: BaseModel, user_id: Optional[int] = None) -> BaseModel:
+    def update(
+        self,
+        record_id: Union[str, int],
+        record: BaseModel,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> BaseModel:
         """Update existing record in Milvus collection with forensic audit logging."""
-        before_item = self.get_by_field(id=record_id)
+        before_item = self.get_by_field(
+            id=record_id, partition_names=[partition_name] if partition_name else None
+        )
         data_before = before_item.model_dump() if before_item else None
 
         data_dict = record.model_dump()
@@ -383,11 +670,15 @@ class CollectionRepository:
             data_dict["update_by"] = user_id
             data_dict["update_in"] = datetime.now(timezone.utc).isoformat()
         payload = {
-            "id": str(record_id),
-            "vector": data_dict[vector_field_name],
+            "id": record_id,
+            vector_field_name: data_dict[vector_field_name],
             **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
         }
-        self.client.upsert(collection_name=self.collection_name, data=[payload])
+        kwargs: dict[str, Any] = {}
+        if partition_name:
+            kwargs["partition_name"] = partition_name
+
+        self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
 
         if self.forensic:
             record_ghost_audit(
@@ -404,13 +695,25 @@ class CollectionRepository:
 
         return record
 
-    def delete(self, record_id: str, user_id: Optional[int] = None, hard: bool = True) -> None:
+    def delete(
+        self,
+        record_id: Union[str, int],
+        user_id: Optional[int] = None,
+        hard: bool = True,
+        partition_name: Optional[str] = None,
+    ) -> None:
         """Delete record by ID from Milvus collection with forensic audit logging."""
-        before_item = self.get_by_field(id=record_id)
+        before_item = self.get_by_field(
+            id=record_id, partition_names=[partition_name] if partition_name else None
+        )
         data_before = before_item.model_dump() if before_item else None
         vector_field_name = self.vector_meta["field_name"]
 
-        self.client.delete(collection_name=self.collection_name, ids=[str(record_id)])
+        kwargs: dict[str, Any] = {}
+        if partition_name:
+            kwargs["partition_name"] = partition_name
+
+        self.client.delete(collection_name=self.collection_name, ids=[record_id], **kwargs)
 
         if self.forensic:
             record_ghost_audit(
@@ -423,6 +726,59 @@ class CollectionRepository:
                 else None,
                 user_id=user_id,
             )
+
+    def delete_batch(
+        self,
+        record_ids: list[Union[str, int]],
+        user_id: Optional[int] = None,
+        hard: bool = True,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Delete a batch of records by IDs from Milvus collection."""
+        if not record_ids:
+            return {"delete_count": 0}
+
+        kwargs: dict[str, Any] = {}
+        if partition_name:
+            kwargs["partition_name"] = partition_name
+
+        res = self.client.delete(collection_name=self.collection_name, ids=record_ids, **kwargs)
+
+        if self.forensic:
+            record_ghost_audit(
+                client=self.client,
+                action_type="BATCH_DELETE",
+                table_name=self.collection_name,
+                record_id=f"batch_{len(record_ids)}_ids",
+                data_before={"ids": [str(x) for x in record_ids]},
+                user_id=user_id,
+            )
+        return res
+
+    def delete_by_expr(
+        self,
+        filter_expr: str,
+        user_id: Optional[int] = None,
+        hard: bool = True,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Delete records matching a filter expression from Milvus collection."""
+        kwargs: dict[str, Any] = {}
+        if partition_name:
+            kwargs["partition_name"] = partition_name
+
+        res = self.client.delete(collection_name=self.collection_name, filter=filter_expr, **kwargs)
+
+        if self.forensic:
+            record_ghost_audit(
+                client=self.client,
+                action_type="EXPR_DELETE",
+                table_name=self.collection_name,
+                record_id=filter_expr[:64],
+                data_before={"filter": filter_expr},
+                user_id=user_id,
+            )
+        return res
 
 
 class WMilvus:
@@ -487,45 +843,101 @@ class WMilvus:
             return self._attr_repos[attr_key]
         raise AttributeError(f"'WMilvus' object has no collection repository named '{name}'")
 
-    def insert(self, record: BaseModel, user_id: Optional[int] = 1) -> BaseModel:
+    def insert(
+        self,
+        record: BaseModel,
+        user_id: Optional[int] = 1,
+        partition_name: Optional[str] = None,
+    ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
-        return repo.insert(record, user_id=user_id)
+        return repo.insert(record, user_id=user_id, partition_name=partition_name)
 
     def insert_batch(
-        self, records: list[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
+        self,
+        records: list[BaseModel],
+        batch_size: int = 1000,
+        user_id: Optional[int] = 1,
+        partition_name: Optional[str] = None,
     ) -> dict[str, Any]:
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
         model_cls = records[0].__class__
         repo = self[model_cls]
-        return repo.insert_batch(records, batch_size=batch_size, user_id=user_id)
+        return repo.insert_batch(
+            records, batch_size=batch_size, user_id=user_id, partition_name=partition_name
+        )
 
-    def get_all(self, limit: int = 100) -> list[BaseModel]:
+    def get_all(
+        self,
+        limit: int = 100,
+        partition_names: Optional[list[str]] = None,
+    ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.get_all(limit=limit)
+            return single_repo.get_all(limit=limit, partition_names=partition_names)
         raise CollectionError(
             "get_all() on main WMilvus instance is only valid in single-collection mode"
         )
 
-    def get_by_field(self, **kwargs: Any) -> Optional[BaseModel]:
+    def get_by_field(
+        self,
+        partition_names: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> Optional[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.get_by_field(**kwargs)
+            return single_repo.get_by_field(partition_names=partition_names, **kwargs)
         raise CollectionError(
             "get_by_field() on main WMilvus instance is only valid in single-collection mode"
         )
+
+    def filter_by(
+        self,
+        limit: int = 100,
+        partition_names: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> list[BaseModel]:
+        if len(self.repositories) == 1:
+            single_repo = next(iter(self.repositories.values()))
+            return single_repo.filter_by(limit=limit, partition_names=partition_names, **kwargs)
+        raise CollectionError(
+            "filter_by() on main WMilvus instance is only valid in single-collection mode"
+        )
+
+    def iter_all(
+        self,
+        batch_size: int = 1000,
+        filter_expr: str = "",
+        partition_names: Optional[list[str]] = None,
+    ) -> Iterator[list[BaseModel]]:
+        if len(self.repositories) == 1:
+            single_repo = next(iter(self.repositories.values()))
+            yield from single_repo.iter_all(
+                batch_size=batch_size, filter_expr=filter_expr, partition_names=partition_names
+            )
+        else:
+            raise CollectionError(
+                "iter_all() on main WMilvus instance is only valid in single-collection mode"
+            )
 
     def search_similar(
         self,
         vector: Union[list[float], np.ndarray],
         top_k: int = 5,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.search_similar(vector=vector, top_k=top_k, filter_expr=filter_expr)
+            return single_repo.search_similar(
+                vector=vector,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+            )
         raise CollectionError(
             "search_similar() on main WMilvus instance is only valid in single-collection mode"
         )
@@ -535,11 +947,17 @@ class WMilvus:
         vector: Union[list[float], np.ndarray],
         top_k: int = 5,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_similar_with_scores(
-                vector=vector, top_k=top_k, filter_expr=filter_expr
+                vector=vector,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
             )
         raise CollectionError(
             "search_similar_with_scores() on main WMilvus instance is only valid in single-collection mode"
@@ -551,11 +969,18 @@ class WMilvus:
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_range(
-                vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+                vector=vector,
+                radius=radius,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
             )
         raise CollectionError(
             "search_range() on main WMilvus instance is only valid in single-collection mode"
@@ -567,11 +992,18 @@ class WMilvus:
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_range_with_scores(
-                vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+                vector=vector,
+                radius=radius,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
             )
         raise CollectionError(
             "search_range_with_scores() on main WMilvus instance is only valid in single-collection mode"
@@ -584,6 +1016,9 @@ class WMilvus:
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
+        ranker: Optional[Any] = None,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
@@ -593,6 +1028,9 @@ class WMilvus:
                 text_field=text_field,
                 filter_expr=filter_expr,
                 top_k=top_k,
+                search_params=search_params,
+                partition_names=partition_names,
+                ranker=ranker,
             )
         raise CollectionError(
             "search_hybrid() on main WMilvus instance is only valid in single-collection mode"
@@ -606,19 +1044,60 @@ class WMilvus:
             "verify_schema() on main WMilvus instance is only valid in single-collection mode"
         )
 
-    def update(self, record_id: str, record: BaseModel, user_id: Optional[int] = None) -> BaseModel:
+    def update(
+        self,
+        record_id: Union[str, int],
+        record: BaseModel,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
-        return repo.update(record_id, record, user_id=user_id)
+        return repo.update(record_id, record, user_id=user_id, partition_name=partition_name)
 
-    def delete(self, record_id: str, user_id: Optional[int] = None) -> None:
+    def delete(
+        self,
+        record_id: Union[str, int],
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> None:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            single_repo.delete(record_id, user_id=user_id)
+            single_repo.delete(record_id, user_id=user_id, partition_name=partition_name)
         else:
             raise CollectionError(
                 "delete() on main WMilvus instance requires specifying repository in multi-collection mode"
             )
+
+    def delete_batch(
+        self,
+        record_ids: list[Union[str, int]],
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if len(self.repositories) == 1:
+            single_repo = next(iter(self.repositories.values()))
+            return single_repo.delete_batch(
+                record_ids, user_id=user_id, partition_name=partition_name
+            )
+        raise CollectionError(
+            "delete_batch() on main WMilvus instance requires specifying repository in multi-collection mode"
+        )
+
+    def delete_by_expr(
+        self,
+        filter_expr: str,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if len(self.repositories) == 1:
+            single_repo = next(iter(self.repositories.values()))
+            return single_repo.delete_by_expr(
+                filter_expr, user_id=user_id, partition_name=partition_name
+            )
+        raise CollectionError(
+            "delete_by_expr() on main WMilvus instance requires specifying repository in multi-collection mode"
+        )
 
     def get_ghost_audit_log(self, limit: int = 100) -> list[dict[str, Any]]:
         """Fetch recorded audit events from global _forensic_audit_log ghost collection."""
@@ -651,34 +1130,91 @@ class AsyncCollectionRepository:
     def __init__(self, sync_repo: CollectionRepository) -> None:
         self._repo = sync_repo
 
-    async def insert(self, record: BaseModel, user_id: Optional[int] = 1) -> BaseModel:
-        return await asyncio.to_thread(self._repo.insert, record, user_id=user_id)
-
-    async def insert_batch(
-        self, records: list[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
-    ) -> dict[str, Any]:
+    async def insert(
+        self,
+        record: BaseModel,
+        user_id: Optional[int] = 1,
+        partition_name: Optional[str] = None,
+    ) -> BaseModel:
         return await asyncio.to_thread(
-            self._repo.insert_batch, records, batch_size=batch_size, user_id=user_id
+            self._repo.insert, record, user_id=user_id, partition_name=partition_name
         )
 
-    async def get_all(self, limit: int = 100) -> list[BaseModel]:
-        return await asyncio.to_thread(self._repo.get_all, limit=limit)
+    async def insert_batch(
+        self,
+        records: list[BaseModel],
+        batch_size: int = 1000,
+        user_id: Optional[int] = 1,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._repo.insert_batch,
+            records,
+            batch_size=batch_size,
+            user_id=user_id,
+            partition_name=partition_name,
+        )
 
-    async def get_by_field(self, **kwargs: Any) -> Optional[BaseModel]:
-        return await asyncio.to_thread(self._repo.get_by_field, **kwargs)
-
-    async def search_similar(
-        self, vector: Union[list[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    async def get_all(
+        self,
+        limit: int = 100,
+        partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         return await asyncio.to_thread(
-            self._repo.search_similar, vector, top_k=top_k, filter_expr=filter_expr
+            self._repo.get_all, limit=limit, partition_names=partition_names
+        )
+
+    async def get_by_field(
+        self,
+        partition_names: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> Optional[BaseModel]:
+        return await asyncio.to_thread(
+            self._repo.get_by_field, partition_names=partition_names, **kwargs
+        )
+
+    async def filter_by(
+        self,
+        limit: int = 100,
+        partition_names: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> list[BaseModel]:
+        return await asyncio.to_thread(
+            self._repo.filter_by, limit=limit, partition_names=partition_names, **kwargs
+        )
+
+    async def search_similar(
+        self,
+        vector: Union[list[float], np.ndarray],
+        top_k: int = 5,
+        filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
+    ) -> list[BaseModel]:
+        return await asyncio.to_thread(
+            self._repo.search_similar,
+            vector,
+            top_k=top_k,
+            filter_expr=filter_expr,
+            search_params=search_params,
+            partition_names=partition_names,
         )
 
     async def search_similar_with_scores(
-        self, vector: Union[list[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+        self,
+        vector: Union[list[float], np.ndarray],
+        top_k: int = 5,
+        filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         return await asyncio.to_thread(
-            self._repo.search_similar_with_scores, vector, top_k=top_k, filter_expr=filter_expr
+            self._repo.search_similar_with_scores,
+            vector,
+            top_k=top_k,
+            filter_expr=filter_expr,
+            search_params=search_params,
+            partition_names=partition_names,
         )
 
     async def search_range(
@@ -687,9 +1223,17 @@ class AsyncCollectionRepository:
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         return await asyncio.to_thread(
-            self._repo.search_range, vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+            self._repo.search_range,
+            vector,
+            radius=radius,
+            top_k=top_k,
+            filter_expr=filter_expr,
+            search_params=search_params,
+            partition_names=partition_names,
         )
 
     async def search_range_with_scores(
@@ -698,6 +1242,8 @@ class AsyncCollectionRepository:
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         return await asyncio.to_thread(
             self._repo.search_range_with_scores,
@@ -705,6 +1251,8 @@ class AsyncCollectionRepository:
             radius=radius,
             top_k=top_k,
             filter_expr=filter_expr,
+            search_params=search_params,
+            partition_names=partition_names,
         )
 
     async def search_hybrid(
@@ -714,6 +1262,9 @@ class AsyncCollectionRepository:
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
+        ranker: Optional[Any] = None,
     ) -> list[BaseModel]:
         return await asyncio.to_thread(
             self._repo.search_hybrid,
@@ -722,18 +1273,64 @@ class AsyncCollectionRepository:
             text_field=text_field,
             filter_expr=filter_expr,
             top_k=top_k,
+            search_params=search_params,
+            partition_names=partition_names,
+            ranker=ranker,
         )
 
     async def verify_schema(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._repo.verify_schema)
 
     async def update(
-        self, record_id: str, record: BaseModel, user_id: Optional[int] = None
+        self,
+        record_id: Union[str, int],
+        record: BaseModel,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
     ) -> BaseModel:
-        return await asyncio.to_thread(self._repo.update, record_id, record, user_id=user_id)
+        return await asyncio.to_thread(
+            self._repo.update,
+            record_id,
+            record,
+            user_id=user_id,
+            partition_name=partition_name,
+        )
 
-    async def delete(self, record_id: str, user_id: Optional[int] = None) -> None:
-        return await asyncio.to_thread(self._repo.delete, record_id, user_id=user_id)
+    async def delete(
+        self,
+        record_id: Union[str, int],
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> None:
+        return await asyncio.to_thread(
+            self._repo.delete, record_id, user_id=user_id, partition_name=partition_name
+        )
+
+    async def delete_batch(
+        self,
+        record_ids: list[Union[str, int]],
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._repo.delete_batch,
+            record_ids,
+            user_id=user_id,
+            partition_name=partition_name,
+        )
+
+    async def delete_by_expr(
+        self,
+        filter_expr: str,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._repo.delete_by_expr,
+            filter_expr,
+            user_id=user_id,
+            partition_name=partition_name,
+        )
 
 
 class AsyncWMilvus:
@@ -766,55 +1363,107 @@ class AsyncWMilvus:
             return self._attr_repos[attr_key]
         raise AttributeError(f"'AsyncWMilvus' object has no collection repository named '{name}'")
 
-    async def insert(self, record: BaseModel, user_id: Optional[int] = 1) -> BaseModel:
+    async def insert(
+        self,
+        record: BaseModel,
+        user_id: Optional[int] = 1,
+        partition_name: Optional[str] = None,
+    ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
-        return await repo.insert(record, user_id=user_id)
+        return await repo.insert(record, user_id=user_id, partition_name=partition_name)
 
     async def insert_batch(
-        self, records: list[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
+        self,
+        records: list[BaseModel],
+        batch_size: int = 1000,
+        user_id: Optional[int] = 1,
+        partition_name: Optional[str] = None,
     ) -> dict[str, Any]:
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
         model_cls = records[0].__class__
         repo = self[model_cls]
-        return await repo.insert_batch(records, batch_size=batch_size, user_id=user_id)
+        return await repo.insert_batch(
+            records, batch_size=batch_size, user_id=user_id, partition_name=partition_name
+        )
 
-    async def get_all(self, limit: int = 100) -> list[BaseModel]:
+    async def get_all(
+        self,
+        limit: int = 100,
+        partition_names: Optional[list[str]] = None,
+    ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.get_all(limit=limit)
+            return await single_repo.get_all(limit=limit, partition_names=partition_names)
         raise CollectionError(
             "get_all() on main AsyncWMilvus instance is only valid in single-collection mode"
         )
 
-    async def get_by_field(self, **kwargs: Any) -> Optional[BaseModel]:
+    async def get_by_field(
+        self,
+        partition_names: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> Optional[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.get_by_field(**kwargs)
+            return await single_repo.get_by_field(partition_names=partition_names, **kwargs)
         raise CollectionError(
             "get_by_field() on main AsyncWMilvus instance is only valid in single-collection mode"
         )
 
+    async def filter_by(
+        self,
+        limit: int = 100,
+        partition_names: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> list[BaseModel]:
+        if len(self.repositories) == 1:
+            single_repo = next(iter(self.repositories.values()))
+            return await single_repo.filter_by(
+                limit=limit, partition_names=partition_names, **kwargs
+            )
+        raise CollectionError(
+            "filter_by() on main AsyncWMilvus instance is only valid in single-collection mode"
+        )
+
     async def search_similar(
-        self, vector: Union[list[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+        self,
+        vector: Union[list[float], np.ndarray],
+        top_k: int = 5,
+        filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_similar(
-                vector=vector, top_k=top_k, filter_expr=filter_expr
+                vector=vector,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
             )
         raise CollectionError(
             "search_similar() on main AsyncWMilvus instance is only valid in single-collection mode"
         )
 
     async def search_similar_with_scores(
-        self, vector: Union[list[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+        self,
+        vector: Union[list[float], np.ndarray],
+        top_k: int = 5,
+        filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_similar_with_scores(
-                vector=vector, top_k=top_k, filter_expr=filter_expr
+                vector=vector,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
             )
         raise CollectionError(
             "search_similar_with_scores() on main AsyncWMilvus instance is only valid in single-collection mode"
@@ -826,11 +1475,18 @@ class AsyncWMilvus:
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_range(
-                vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+                vector=vector,
+                radius=radius,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
             )
         raise CollectionError(
             "search_range() on main AsyncWMilvus instance is only valid in single-collection mode"
@@ -842,11 +1498,18 @@ class AsyncWMilvus:
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_range_with_scores(
-                vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
+                vector=vector,
+                radius=radius,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
             )
         raise CollectionError(
             "search_range_with_scores() on main AsyncWMilvus instance is only valid in single-collection mode"
@@ -859,6 +1522,9 @@ class AsyncWMilvus:
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
+        search_params: Optional[dict[str, Any]] = None,
+        partition_names: Optional[list[str]] = None,
+        ranker: Optional[Any] = None,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
@@ -868,6 +1534,9 @@ class AsyncWMilvus:
                 text_field=text_field,
                 filter_expr=filter_expr,
                 top_k=top_k,
+                search_params=search_params,
+                partition_names=partition_names,
+                ranker=ranker,
             )
         raise CollectionError(
             "search_hybrid() on main AsyncWMilvus instance is only valid in single-collection mode"
@@ -882,20 +1551,59 @@ class AsyncWMilvus:
         )
 
     async def update(
-        self, record_id: str, record: BaseModel, user_id: Optional[int] = None
+        self,
+        record_id: Union[str, int],
+        record: BaseModel,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
     ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
-        return await repo.update(record_id, record, user_id=user_id)
+        return await repo.update(record_id, record, user_id=user_id, partition_name=partition_name)
 
-    async def delete(self, record_id: str, user_id: Optional[int] = None) -> None:
+    async def delete(
+        self,
+        record_id: Union[str, int],
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> None:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            await single_repo.delete(record_id, user_id=user_id)
+            await single_repo.delete(record_id, user_id=user_id, partition_name=partition_name)
         else:
             raise CollectionError(
                 "delete() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
             )
+
+    async def delete_batch(
+        self,
+        record_ids: list[Union[str, int]],
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if len(self.repositories) == 1:
+            single_repo = next(iter(self.repositories.values()))
+            return await single_repo.delete_batch(
+                record_ids, user_id=user_id, partition_name=partition_name
+            )
+        raise CollectionError(
+            "delete_batch() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
+        )
+
+    async def delete_by_expr(
+        self,
+        filter_expr: str,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if len(self.repositories) == 1:
+            single_repo = next(iter(self.repositories.values()))
+            return await single_repo.delete_by_expr(
+                filter_expr, user_id=user_id, partition_name=partition_name
+            )
+        raise CollectionError(
+            "delete_by_expr() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
+        )
 
     async def get_ghost_audit_log(self, limit: int = 100) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._sync_client.get_ghost_audit_log, limit=limit)
