@@ -1,9 +1,10 @@
 """WMilvus Pydantic ORM Repository and Multi-Collection Client."""
 
 import asyncio
+import contextlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 from loguru import logger
@@ -15,7 +16,7 @@ from wmilvus.types import ForensicModel, SearchMatch
 GHOST_AUDIT_LOG_COLLECTION = "_forensic_audit_log"
 
 
-def get_model_tablename(model_cls: Type[BaseModel]) -> str:
+def get_model_tablename(model_cls: type[BaseModel]) -> str:
     """Extract table/collection name from Pydantic model class attribute or class name."""
     if hasattr(model_cls, "__tablename__"):
         return model_cls.__tablename__
@@ -24,7 +25,7 @@ def get_model_tablename(model_cls: Type[BaseModel]) -> str:
     return model_cls.__name__.lower()
 
 
-def inspect_model_vector_field(model_cls: Type[BaseModel]) -> Dict[str, Any]:
+def inspect_model_vector_field(model_cls: type[BaseModel]) -> dict[str, Any]:
     """Inspect Pydantic model fields to identify the vector field and its configuration."""
     for field_name, field_info in model_cls.model_fields.items():
         json_extra = field_info.json_schema_extra
@@ -64,8 +65,8 @@ def record_ghost_audit(
     action_type: str,
     table_name: str,
     record_id: str,
-    data_before: Optional[Dict[str, Any]] = None,
-    data_after: Optional[Dict[str, Any]] = None,
+    data_before: Optional[dict[str, Any]] = None,
+    data_after: Optional[dict[str, Any]] = None,
     user_id: Optional[int] = 1,
 ) -> None:
     """Record an audit trail event in the global _forensic_audit_log collection."""
@@ -88,7 +89,7 @@ class CollectionRepository:
     """Repository bound to a specific Pydantic model class for single-collection ORM operations."""
 
     def __init__(
-        self, client: MilvusClient, model_cls: Type[BaseModel], forensic: bool = False
+        self, client: MilvusClient, model_cls: type[BaseModel], forensic: bool = False
     ) -> None:
         self.client = client
         self.model_cls = model_cls
@@ -126,10 +127,8 @@ class CollectionRepository:
             **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
         }
         self.client.upsert(collection_name=self.collection_name, data=[payload])
-        try:
+        with contextlib.suppress(Exception):
             self.client.flush(collection_name=self.collection_name)
-        except Exception:
-            pass
 
         if self.forensic:
             record_ghost_audit(
@@ -144,10 +143,10 @@ class CollectionRepository:
 
     def insert_batch(
         self,
-        records: List[BaseModel],
+        records: list[BaseModel],
         batch_size: int = 1000,
         user_id: Optional[int] = 1,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Perform bulk insertion of vector records in configurable batch chunks."""
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
@@ -178,10 +177,8 @@ class CollectionRepository:
                 f"Inserted batch {batches_processed} ({len(chunk)} records) into '{self.collection_name}'"
             )
 
-        try:
+        with contextlib.suppress(Exception):
             self.client.flush(collection_name=self.collection_name)
-        except Exception:
-            pass
 
         if self.forensic and records:
             record_ghost_audit(
@@ -195,16 +192,16 @@ class CollectionRepository:
 
         return {"inserted_count": total_records, "batches_processed": batches_processed}
 
-    def get_all(self, limit: int = 100) -> List[BaseModel]:
+    def get_all(self, limit: int = 100) -> list[BaseModel]:
         """Query all records from the collection up to the specified limit."""
         raw_items = self.client.query(
             collection_name=self.collection_name,
-            filter="id != '0'",
+            filter="",
             output_fields=["*"],
             limit=limit,
         )
         vector_field_name = self.vector_meta["field_name"]
-        results: List[BaseModel] = []
+        results: list[BaseModel] = []
         for item in raw_items:
             obj_data = {k: v for k, v in item.items() if k != "vector"}
             if "vector" in item:
@@ -239,10 +236,10 @@ class CollectionRepository:
 
     def search_similar(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         top_k: int = 5,
         filter_expr: str = "",
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         """Perform vector similarity search returning typed Pydantic model instances."""
         vec_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
         search_output = self.client.search(
@@ -253,7 +250,7 @@ class CollectionRepository:
             output_fields=["*"],
         )
         vector_field_name = self.vector_meta["field_name"]
-        results: List[BaseModel] = []
+        results: list[BaseModel] = []
         if search_output and len(search_output) > 0:
             for item in search_output[0]:
                 entity = item.get("entity", {})
@@ -265,10 +262,10 @@ class CollectionRepository:
 
     def search_similar_with_scores(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         top_k: int = 5,
         filter_expr: str = "",
-    ) -> List[SearchMatch]:
+    ) -> list[SearchMatch]:
         """Perform vector similarity search returning SearchMatch instances with similarity scores."""
         vec_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
         search_output = self.client.search(
@@ -278,7 +275,7 @@ class CollectionRepository:
             filter=filter_expr,
             output_fields=["*"],
         )
-        results: List[SearchMatch] = []
+        results: list[SearchMatch] = []
         if search_output and len(search_output) > 0:
             for item in search_output[0]:
                 entity = item.get("entity", {})
@@ -290,16 +287,16 @@ class CollectionRepository:
 
     def search_range(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         """Perform vector similarity range search filtering by minimum similarity score / radius threshold."""
         matches_scores = self.search_range_with_scores(
             vector=vector, radius=radius, top_k=top_k, filter_expr=filter_expr
         )
-        results: List[BaseModel] = []
+        results: list[BaseModel] = []
         for match in matches_scores:
             rec = self.get_by_field(id=match.id)
             if rec:
@@ -308,11 +305,11 @@ class CollectionRepository:
 
     def search_range_with_scores(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
-    ) -> List[SearchMatch]:
+    ) -> list[SearchMatch]:
         """Perform vector similarity range search returning SearchMatch items above radius score."""
         all_matches = self.search_similar_with_scores(
             vector=vector, top_k=top_k, filter_expr=filter_expr
@@ -321,12 +318,12 @@ class CollectionRepository:
 
     def search_hybrid(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         text_query: Optional[str] = None,
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         """Perform hybrid similarity search combining dense vector search with text/scalar filtering expressions."""
         combined_filter = filter_expr
         if text_query and text_field:
@@ -335,7 +332,7 @@ class CollectionRepository:
 
         return self.search_similar(vector=vector, top_k=top_k, filter_expr=combined_filter)
 
-    def verify_schema(self) -> Dict[str, Any]:
+    def verify_schema(self) -> dict[str, Any]:
         """Verify that the Milvus collection schema matches the bound Pydantic model definition."""
         if not self.client.has_collection(collection_name=self.collection_name):
             raise ValidationError(f"Collection '{self.collection_name}' does not exist in Milvus")
@@ -348,8 +345,9 @@ class CollectionRepository:
         vector_field_found = False
         mismatches = []
 
+        vector_field_name = self.vector_meta["field_name"]
         for f in fields:
-            if f.get("name") == "vector":
+            if f.get("name") in (vector_field_name, "vector"):
                 vector_field_found = True
                 params = f.get("params", {})
                 coll_dim = params.get("dim") or f.get("dim")
@@ -359,7 +357,7 @@ class CollectionRepository:
                     )
 
         if not vector_field_found:
-            mismatches.append("Vector field 'vector' not found in collection schema")
+            mismatches.append(f"Vector field '{vector_field_name}' not found in collection schema")
 
         if mismatches:
             raise ValidationError(
@@ -432,8 +430,8 @@ class WMilvus:
 
     def __init__(
         self,
-        models: Union[Type[BaseModel], List[Type[BaseModel]]],
-        config: Optional[Union[str, Dict[str, Any]]] = None,
+        models: Union[type[BaseModel], list[type[BaseModel]]],
+        config: Optional[Union[str, dict[str, Any]]] = None,
         forensic: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -468,8 +466,8 @@ class WMilvus:
         if not model_list:
             raise ValidationError("WMilvus requires at least one Pydantic model class")
 
-        self.repositories: Dict[Type[BaseModel], CollectionRepository] = {}
-        self._attr_repos: Dict[str, CollectionRepository] = {}
+        self.repositories: dict[type[BaseModel], CollectionRepository] = {}
+        self._attr_repos: dict[str, CollectionRepository] = {}
 
         for model_cls in model_list:
             repo = CollectionRepository(self.client, model_cls, forensic=forensic)
@@ -478,7 +476,7 @@ class WMilvus:
             self._attr_repos[table_name] = repo
             self._attr_repos[model_cls.__name__.lower()] = repo
 
-    def __getitem__(self, item: Type[BaseModel]) -> CollectionRepository:
+    def __getitem__(self, item: type[BaseModel]) -> CollectionRepository:
         if item in self.repositories:
             return self.repositories[item]
         raise CollectionError(f"No repository registered for model '{item.__name__}'")
@@ -495,15 +493,15 @@ class WMilvus:
         return repo.insert(record, user_id=user_id)
 
     def insert_batch(
-        self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
-    ) -> Dict[str, Any]:
+        self, records: list[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
+    ) -> dict[str, Any]:
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
         model_cls = records[0].__class__
         repo = self[model_cls]
         return repo.insert_batch(records, batch_size=batch_size, user_id=user_id)
 
-    def get_all(self, limit: int = 100) -> List[BaseModel]:
+    def get_all(self, limit: int = 100) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.get_all(limit=limit)
@@ -521,10 +519,10 @@ class WMilvus:
 
     def search_similar(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         top_k: int = 5,
         filter_expr: str = "",
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_similar(vector=vector, top_k=top_k, filter_expr=filter_expr)
@@ -534,10 +532,10 @@ class WMilvus:
 
     def search_similar_with_scores(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         top_k: int = 5,
         filter_expr: str = "",
-    ) -> List[SearchMatch]:
+    ) -> list[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_similar_with_scores(
@@ -549,11 +547,11 @@ class WMilvus:
 
     def search_range(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_range(
@@ -565,11 +563,11 @@ class WMilvus:
 
     def search_range_with_scores(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
-    ) -> List[SearchMatch]:
+    ) -> list[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_range_with_scores(
@@ -581,12 +579,12 @@ class WMilvus:
 
     def search_hybrid(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         text_query: Optional[str] = None,
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_hybrid(
@@ -600,7 +598,7 @@ class WMilvus:
             "search_hybrid() on main WMilvus instance is only valid in single-collection mode"
         )
 
-    def verify_schema(self) -> Dict[str, Any]:
+    def verify_schema(self) -> dict[str, Any]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.verify_schema()
@@ -622,11 +620,11 @@ class WMilvus:
                 "delete() on main WMilvus instance requires specifying repository in multi-collection mode"
             )
 
-    def get_ghost_audit_log(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_ghost_audit_log(self, limit: int = 100) -> list[dict[str, Any]]:
         """Fetch recorded audit events from global _forensic_audit_log ghost collection."""
         raw_items = self.client.query(
             collection_name=GHOST_AUDIT_LOG_COLLECTION,
-            filter="id != 0",
+            filter="",
             output_fields=["*"],
             limit=limit,
         )
@@ -657,50 +655,50 @@ class AsyncCollectionRepository:
         return await asyncio.to_thread(self._repo.insert, record, user_id=user_id)
 
     async def insert_batch(
-        self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
-    ) -> Dict[str, Any]:
+        self, records: list[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
+    ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._repo.insert_batch, records, batch_size=batch_size, user_id=user_id
         )
 
-    async def get_all(self, limit: int = 100) -> List[BaseModel]:
+    async def get_all(self, limit: int = 100) -> list[BaseModel]:
         return await asyncio.to_thread(self._repo.get_all, limit=limit)
 
     async def get_by_field(self, **kwargs: Any) -> Optional[BaseModel]:
         return await asyncio.to_thread(self._repo.get_by_field, **kwargs)
 
     async def search_similar(
-        self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
-    ) -> List[BaseModel]:
+        self, vector: Union[list[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    ) -> list[BaseModel]:
         return await asyncio.to_thread(
             self._repo.search_similar, vector, top_k=top_k, filter_expr=filter_expr
         )
 
     async def search_similar_with_scores(
-        self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
-    ) -> List[SearchMatch]:
+        self, vector: Union[list[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    ) -> list[SearchMatch]:
         return await asyncio.to_thread(
             self._repo.search_similar_with_scores, vector, top_k=top_k, filter_expr=filter_expr
         )
 
     async def search_range(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         return await asyncio.to_thread(
             self._repo.search_range, vector, radius=radius, top_k=top_k, filter_expr=filter_expr
         )
 
     async def search_range_with_scores(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
-    ) -> List[SearchMatch]:
+    ) -> list[SearchMatch]:
         return await asyncio.to_thread(
             self._repo.search_range_with_scores,
             vector,
@@ -711,12 +709,12 @@ class AsyncCollectionRepository:
 
     async def search_hybrid(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         text_query: Optional[str] = None,
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         return await asyncio.to_thread(
             self._repo.search_hybrid,
             vector,
@@ -726,7 +724,7 @@ class AsyncCollectionRepository:
             top_k=top_k,
         )
 
-    async def verify_schema(self) -> Dict[str, Any]:
+    async def verify_schema(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._repo.verify_schema)
 
     async def update(
@@ -743,21 +741,21 @@ class AsyncWMilvus:
 
     def __init__(
         self,
-        models: Union[Type[BaseModel], List[Type[BaseModel]]],
-        config: Optional[Union[str, Dict[str, Any]]] = None,
+        models: Union[type[BaseModel], list[type[BaseModel]]],
+        config: Optional[Union[str, dict[str, Any]]] = None,
         forensic: bool = False,
         **kwargs: Any,
     ) -> None:
         self._sync_client = WMilvus(models, config=config, forensic=forensic, **kwargs)
-        self.repositories: Dict[Type[BaseModel], AsyncCollectionRepository] = {
+        self.repositories: dict[type[BaseModel], AsyncCollectionRepository] = {
             cls: AsyncCollectionRepository(repo)
             for cls, repo in self._sync_client.repositories.items()
         }
-        self._attr_repos: Dict[str, AsyncCollectionRepository] = {
+        self._attr_repos: dict[str, AsyncCollectionRepository] = {
             k: AsyncCollectionRepository(repo) for k, repo in self._sync_client._attr_repos.items()
         }
 
-    def __getitem__(self, item: Type[BaseModel]) -> AsyncCollectionRepository:
+    def __getitem__(self, item: type[BaseModel]) -> AsyncCollectionRepository:
         if item in self.repositories:
             return self.repositories[item]
         raise CollectionError(f"No async repository registered for model '{item.__name__}'")
@@ -774,15 +772,15 @@ class AsyncWMilvus:
         return await repo.insert(record, user_id=user_id)
 
     async def insert_batch(
-        self, records: List[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
-    ) -> Dict[str, Any]:
+        self, records: list[BaseModel], batch_size: int = 1000, user_id: Optional[int] = 1
+    ) -> dict[str, Any]:
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
         model_cls = records[0].__class__
         repo = self[model_cls]
         return await repo.insert_batch(records, batch_size=batch_size, user_id=user_id)
 
-    async def get_all(self, limit: int = 100) -> List[BaseModel]:
+    async def get_all(self, limit: int = 100) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.get_all(limit=limit)
@@ -799,8 +797,8 @@ class AsyncWMilvus:
         )
 
     async def search_similar(
-        self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
-    ) -> List[BaseModel]:
+        self, vector: Union[list[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_similar(
@@ -811,8 +809,8 @@ class AsyncWMilvus:
         )
 
     async def search_similar_with_scores(
-        self, vector: Union[List[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
-    ) -> List[SearchMatch]:
+        self, vector: Union[list[float], np.ndarray], top_k: int = 5, filter_expr: str = ""
+    ) -> list[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_similar_with_scores(
@@ -824,11 +822,11 @@ class AsyncWMilvus:
 
     async def search_range(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_range(
@@ -840,11 +838,11 @@ class AsyncWMilvus:
 
     async def search_range_with_scores(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
         filter_expr: str = "",
-    ) -> List[SearchMatch]:
+    ) -> list[SearchMatch]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_range_with_scores(
@@ -856,12 +854,12 @@ class AsyncWMilvus:
 
     async def search_hybrid(
         self,
-        vector: Union[List[float], np.ndarray],
+        vector: Union[list[float], np.ndarray],
         text_query: Optional[str] = None,
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
-    ) -> List[BaseModel]:
+    ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_hybrid(
@@ -875,7 +873,7 @@ class AsyncWMilvus:
             "search_hybrid() on main AsyncWMilvus instance is only valid in single-collection mode"
         )
 
-    async def verify_schema(self) -> Dict[str, Any]:
+    async def verify_schema(self) -> dict[str, Any]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.verify_schema()
@@ -899,7 +897,7 @@ class AsyncWMilvus:
                 "delete() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
             )
 
-    async def get_ghost_audit_log(self, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_ghost_audit_log(self, limit: int = 100) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._sync_client.get_ghost_audit_log, limit=limit)
 
     async def close(self) -> None:
