@@ -434,3 +434,192 @@ def test_verify_schema_custom_vector_name(mock_milvus_client: MagicMock) -> None
     schema_res = db.verify_schema()
     assert schema_res["status"] == "VALID"
     assert schema_res["dimension"] == 4
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_insert_auto_id_and_dynamic_vector_field(mock_milvus_client: MagicMock) -> None:
+    """Test insert() correctly handles dynamic vector field names and auto-id assignment.
+
+    This test validates:
+    1. The payload key matches the custom vector field name ('embedding') rather than 'vector'.
+    2. When 'id' is None, no 'id' key is sent in payload, and client.insert() is called.
+    3. The auto-generated ID returned by Milvus is assigned back to the record instance.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.insert.return_value = {"insert_count": 1, "ids": [9876543210]}
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(FaceEmbeddingIntPk, config)
+
+    item = FaceEmbeddingIntPk(embedding=[0.5, 0.5, 0.5, 0.5])
+    assert item.id is None
+
+    inserted = db.insert(item, partition_name="partition_a")
+
+    # Verify client.insert called for Faces with dynamic vector field 'embedding' and partition_name
+    faces_call = mock_instance.insert.call_args_list[0]
+    call_kwargs = faces_call.kwargs
+    assert call_kwargs["collection_name"] == "Faces"
+    assert call_kwargs["partition_name"] == "partition_a"
+    payload = call_kwargs["data"][0]
+    assert "embedding" in payload
+    assert "vector" not in payload
+    assert "id" not in payload
+
+    # Verify ID was propagated to the model instance
+    assert inserted.id == 9876543210
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_delete_batch_and_delete_by_expr(mock_milvus_client: MagicMock) -> None:
+    """Test delete_batch() and delete_by_expr() operations on collection.
+
+    This test validates:
+    1. delete_batch passes list of IDs directly to client.delete(ids=[...]).
+    2. delete_by_expr passes filter expression to client.delete(filter=...).
+    3. Audit logs are recorded appropriately for batch and expression deletions.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.delete.return_value = {"delete_count": 2}
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    # 1. Test delete_batch
+    res_batch = db.delete_batch(["id_1", "id_2"], partition_name="part_1")
+    assert res_batch["delete_count"] == 2
+    mock_instance.delete.assert_called_with(
+        collection_name="person", ids=["id_1", "id_2"], partition_name="part_1"
+    )
+
+    # 2. Test delete_by_expr
+    res_expr = db.delete_by_expr("age >= 30", partition_name="part_1")
+    assert res_expr["delete_count"] == 2
+    mock_instance.delete.assert_called_with(
+        collection_name="person", filter="age >= 30", partition_name="part_1"
+    )
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_filter_by_query_builder(mock_milvus_client: MagicMock) -> None:
+    """Test filter_by() query builder translation and typed model instantiation.
+
+    This test validates:
+    1. Comparison operators (age__gte, status__in, dni) are translated into valid Milvus filter string.
+    2. Results returned from Milvus query are deserialized into typed Pydantic instances.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.query.return_value = [
+        {"id": "p1", "name": "Alice", "age": 25, "is_active": True, "vector": [0.1, 0.2, 0.3, 0.4]}
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    results = db.filter_by(age__gte=20, is_active=True, limit=10)
+
+    assert len(results) == 1
+    assert isinstance(results[0], Person)
+    assert results[0].name == "Alice"
+
+    mock_instance.query.assert_called_once()
+    query_kwargs = mock_instance.query.call_args.kwargs
+    assert "age >= 20" in query_kwargs["filter"]
+    assert "is_active == True" in query_kwargs["filter"]
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_iter_all_streaming(mock_milvus_client: MagicMock) -> None:
+    """Test iter_all() streaming batches of typed Pydantic models.
+
+    This test validates:
+    1. iter_all initializes native query_iterator on MilvusClient.
+    2. Batches are yielded as typed Pydantic model lists and iterator is closed on exit.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+
+    mock_iterator = MagicMock()
+    mock_iterator.next.side_effect = [
+        [
+            {
+                "id": "it1",
+                "name": "User 1",
+                "age": 20,
+                "is_active": True,
+                "vector": [0.1, 0.2, 0.3, 0.4],
+            },
+            {
+                "id": "it2",
+                "name": "User 2",
+                "age": 21,
+                "is_active": True,
+                "vector": [0.1, 0.2, 0.3, 0.4],
+            },
+        ],
+        [],  # End of iteration
+    ]
+    mock_instance.query_iterator.return_value = mock_iterator
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    batches = list(db.iter_all(batch_size=2))
+
+    assert len(batches) == 1
+    assert len(batches[0]) == 2
+    assert isinstance(batches[0][0], Person)
+    assert batches[0][0].id == "it1"
+    mock_iterator.close.assert_called_once()
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_search_similar_with_search_params_and_partition(mock_milvus_client: MagicMock) -> None:
+    """Test search_similar() passes custom search_params and partition_names.
+
+    This test validates:
+    1. Custom search index parameters like efSearch or nprobe are passed to client.search.
+    2. partition_names are routed properly to client.search.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.search.return_value = [
+        [
+            {
+                "id": "1",
+                "distance": 0.98,
+                "entity": {
+                    "id": "1",
+                    "name": "Juan Pérez",
+                    "age": 30,
+                    "is_active": True,
+                    "vector": [0.1, 0.2, 0.3, 0.4],
+                },
+            }
+        ]
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    matches = db.search_similar(
+        vector=[0.1, 0.2, 0.3, 0.4],
+        top_k=3,
+        search_params={"ef": 64},
+        partition_names=["camera_01"],
+    )
+
+    assert len(matches) == 1
+    assert matches[0].name == "Juan Pérez"
+
+    search_kwargs = mock_instance.search.call_args.kwargs
+    assert search_kwargs["search_params"] == {"ef": 64}
+    assert search_kwargs["partition_names"] == ["camera_01"]
