@@ -18,6 +18,7 @@
 
 - **Pydantic Model Declarations** — Define collections as standard Pydantic models with vector annotations (`FieldVector`, `MetricType`, `IndexType`).
 - **Vector Similarity & Range Search** — KNN similarity search (`search_similar`), similarity distance scores (`search_similar_with_scores`), and similarity range threshold search (`search_range`).
+- **Universal Primary Key Support** — Full compatibility with both `INT64` (auto-increment) and `VARCHAR` primary keys in `get_all()`, `get_by_field()`, and audit queries.
 - **Bulk Vector Ingestion** — High-performance chunked bulk insertion (`insert_batch`) with configurable payload size limits.
 - **Async Client Support (`AsyncWMilvus`)** — Non-blocking async client with `async with` context manager for FastAPI and asyncio applications.
 - **Schema Verification (`verify_schema`)** — Verification of Pydantic model vector dimensions against active Milvus collection schemas.
