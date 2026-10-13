@@ -321,7 +321,13 @@ def test_wsqlite_export_import_flow(mock_milvus_client: MagicMock, tmp_path: Any
     mock_instance = MagicMock()
     mock_instance.has_collection.return_value = False
     mock_instance.query.return_value = [
-        {"id": "sq1", "name": "Backup User", "age": 35, "is_active": True, "vector": [0.1, 0.2, 0.3, 0.4]}
+        {
+            "id": "sq1",
+            "name": "Backup User",
+            "age": 35,
+            "is_active": True,
+            "vector": [0.1, 0.2, 0.3, 0.4],
+        }
     ]
     mock_milvus_client.return_value = mock_instance
 
@@ -330,7 +336,9 @@ def test_wsqlite_export_import_flow(mock_milvus_client: MagicMock, tmp_path: Any
 
     db.get_all = MagicMock(
         return_value=[
-            Person(id="sq1", name="Backup User", age=35, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4])
+            Person(
+                id="sq1", name="Backup User", age=35, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4]
+            )
         ]
     )
 
@@ -346,3 +354,83 @@ def test_wsqlite_export_import_flow(mock_milvus_client: MagicMock, tmp_path: Any
     assert imp_res["imported_count"] == 1
     assert imp_res["status"] == "SUCCESS"
 
+
+class FaceEmbeddingIntPk(ForensicModel):
+    """Pydantic model representing a Milvus collection with INT64 auto-increment PK."""
+
+    __tablename__ = "Faces"
+
+    id: int | None = None
+    embedding: list[float] = FieldVector(dim=4, metric_type="COSINE")
+    embedding_norm: float = 1.0
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_get_all_universal_filter_and_int64_pk(mock_milvus_client: MagicMock) -> None:
+    """Test get_all() uses an empty filter query compatible with INT64 and VARCHAR keys.
+
+    This test validates:
+    1. Query call to MilvusClient passes filter="" so collections with INT64 or VARCHAR
+       primary keys do not trigger type mismatch errors.
+    2. Model records with INT64 primary keys and custom vector field names are properly
+       parsed and instantiated into Pydantic model instances.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.query.return_value = [
+        {
+            "id": 468847727109203484,
+            "embedding": [0.1, 0.2, 0.3, 0.4],
+            "embedding_norm": 1.0,
+            "dni": "00000000P",
+            "file_name": "test.png",
+        }
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(FaceEmbeddingIntPk, config)
+
+    results = db.get_all(limit=50)
+
+    # Validate that client.query was called with filter="" to support int/varchar keys
+    mock_instance.query.assert_called_with(
+        collection_name="Faces",
+        filter="",
+        output_fields=["*"],
+        limit=50,
+    )
+
+    # Validate result parsing and typed Pydantic instance attributes
+    assert len(results) == 1
+    assert isinstance(results[0], FaceEmbeddingIntPk)
+    assert results[0].id == 468847727109203484
+    assert results[0].embedding_norm == 1.0
+    assert results[0].embedding == [0.1, 0.2, 0.3, 0.4]
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_verify_schema_custom_vector_name(mock_milvus_client: MagicMock) -> None:
+    """Test verify_schema() succeeds when vector field matches the model field name.
+
+    This test validates:
+    1. Collections whose vector field is named after the model attribute (e.g. 'embedding')
+       rather than the default 'vector' pass schema verification.
+    2. Dimensionality checks are performed accurately against the custom vector field.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.describe_collection.return_value = {
+        "fields": [
+            {"name": "id", "params": {}},
+            {"name": "embedding", "params": {"dim": 4}},
+        ]
+    }
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(FaceEmbeddingIntPk, config)
+
+    schema_res = db.verify_schema()
+    assert schema_res["status"] == "VALID"
+    assert schema_res["dimension"] == 4
