@@ -1,10 +1,13 @@
 """WMilvus - Milvus Vector Database ORM using Pydantic models."""
 
+from pymilvus import RRFRanker, WeightedRanker
+
 from wmilvus.core.client import (
     AsyncCollectionRepository,
     AsyncWMilvus,
     CollectionRepository,
     WMilvus,
+    build_filter_expr,
 )
 from wmilvus.exceptions import (
     CollectionError,
@@ -25,7 +28,7 @@ from wmilvus.types import (
     normalize_vector,
 )
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     "WMilvus",
@@ -42,6 +45,9 @@ __all__ = [
     "WMilvusIngestStep",
     "export_to_sqlite",
     "import_from_sqlite",
+    "build_filter_expr",
+    "RRFRanker",
+    "WeightedRanker",
     "WMilvusError",
     "ConnectionError",
     "CollectionError",
