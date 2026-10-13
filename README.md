@@ -109,6 +109,11 @@ The repository includes organized example scripts in `examples/`:
 - [`examples/16_forensic_fields/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/16_forensic_fields/example.py) — Forensic field tracking (`create_by`, `create_in`, `update_by`).
 - [`examples/17_multi_table/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/17_multi_table/example.py) — Multi-collection management & repository routing.
 - [`examples/18_ghost_table_audit/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/18_ghost_table_audit/example.py) — Enterprise global audit trail (`_forensic_audit_log`).
+- [`examples/19_auto_id_and_int64_pk/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/19_auto_id_and_int64_pk/example.py) — Auto-increment `INT64` primary key handling and model back-population.
+- [`examples/20_query_builder_filter_by/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/20_query_builder_filter_by/example.py) — Fluent query builder with comparison operators (`__gte`, `__in`, `__lt`) and chained pagination.
+- [`examples/21_streaming_iter_all/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/21_streaming_iter_all/example.py) — Memory-efficient streaming iterators (`iter_all`) across large collections.
+- [`examples/22_partition_routing/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/22_partition_routing/example.py) — Creating collection partitions, targeted partition ingestion, and partition-scoped search.
+- [`examples/23_batch_and_expr_deletion/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/23_batch_and_expr_deletion/example.py) — High-performance batch ID deletion and conditional deletion via Milvus boolean expressions.
 
 ## Running Tests
 
