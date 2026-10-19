@@ -150,13 +150,18 @@ class CollectionRepository:
     """Repository bound to a specific Pydantic model class for single-collection ORM operations."""
 
     def __init__(
-        self, client: MilvusClient, model_cls: type[BaseModel], forensic: bool = False
+        self,
+        client: MilvusClient,
+        model_cls: type[BaseModel],
+        forensic: bool = False,
+        consistency_level: Optional[str] = None,
     ) -> None:
         self.client = client
         self.model_cls = model_cls
         self.collection_name = get_model_tablename(model_cls)
         self.vector_meta = inspect_model_vector_field(model_cls)
         self.forensic = forensic or issubclass(model_cls, ForensicModel)
+        self.consistency_level = consistency_level
         self._ensure_collection()
 
     def _ensure_collection(self) -> None:
@@ -369,6 +374,8 @@ class CollectionRepository:
         kwargs: dict[str, Any] = {}
         if partition_names:
             kwargs["partition_names"] = partition_names
+        if self.consistency_level:
+            kwargs.setdefault("consistency_level", self.consistency_level)
 
         raw_items = self.client.query(
             collection_name=self.collection_name,
@@ -403,6 +410,8 @@ class CollectionRepository:
         extra_kwargs: dict[str, Any] = {}
         if partition_names:
             extra_kwargs["partition_names"] = partition_names
+        if self.consistency_level:
+            extra_kwargs.setdefault("consistency_level", self.consistency_level)
 
         raw_items = self.client.query(
             collection_name=self.collection_name,
@@ -431,6 +440,8 @@ class CollectionRepository:
         extra_kwargs: dict[str, Any] = {}
         if partition_names:
             extra_kwargs["partition_names"] = partition_names
+        if self.consistency_level:
+            extra_kwargs.setdefault("consistency_level", self.consistency_level)
 
         raw_items = self.client.query(
             collection_name=self.collection_name,
@@ -498,6 +509,8 @@ class CollectionRepository:
             kwargs["search_params"] = search_params
         if partition_names:
             kwargs["partition_names"] = partition_names
+        if self.consistency_level:
+            kwargs.setdefault("consistency_level", self.consistency_level)
 
         search_output = self.client.search(
             collection_name=self.collection_name,
@@ -534,6 +547,8 @@ class CollectionRepository:
             kwargs["search_params"] = search_params
         if partition_names:
             kwargs["partition_names"] = partition_names
+        if self.consistency_level:
+            kwargs.setdefault("consistency_level", self.consistency_level)
 
         search_output = self.client.search(
             collection_name=self.collection_name,
@@ -694,6 +709,9 @@ class CollectionRepository:
 
         self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
 
+        with contextlib.suppress(Exception):
+            self.client.flush(collection_name=self.collection_name)
+
         if self.forensic:
             record_ghost_audit(
                 client=self.client,
@@ -850,8 +868,14 @@ class WMilvus:
         self.repositories: dict[type[BaseModel], CollectionRepository] = {}
         self._attr_repos: dict[str, CollectionRepository] = {}
 
+        consistency_level = kwargs.get("consistency_level")
         for model_cls in model_list:
-            repo = CollectionRepository(self.client, model_cls, forensic=forensic)
+            repo = CollectionRepository(
+                self.client,
+                model_cls,
+                forensic=forensic,
+                consistency_level=consistency_level,
+            )
             self.repositories[model_cls] = repo
             table_name = get_model_tablename(model_cls)
             self._attr_repos[table_name] = repo
