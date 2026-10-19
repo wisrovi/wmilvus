@@ -219,6 +219,18 @@ class CollectionRepository:
                 logger.info(
                     f"Created collection '{self.collection_name}' for model {self.model_cls.__name__}"
                 )
+        else:
+            try:
+                load_state = self.client.get_load_state(collection_name=self.collection_name)
+                if isinstance(load_state, dict):
+                    state_val = str(load_state.get("state", ""))
+                    if "NotLoad" in state_val or "NotExist" in state_val:
+                        self.client.load_collection(collection_name=self.collection_name)
+                        logger.info(
+                            f"Loaded existing collection '{self.collection_name}' into memory"
+                        )
+            except Exception as e:
+                logger.debug(f"Could not verify or load collection '{self.collection_name}': {e}")
 
     def insert(
         self,
@@ -227,7 +239,7 @@ class CollectionRepository:
         partition_name: Optional[str] = None,
     ) -> BaseModel:
         """Insert a single typed Pydantic model instance into Milvus with forensic audit logging."""
-        data_dict = record.model_dump()
+        data_dict = record.model_dump(mode="json")
         vector_field_name = self.vector_meta["field_name"]
         if self.forensic and user_id is not None:
             data_dict["create_by"] = user_id
@@ -298,7 +310,7 @@ class CollectionRepository:
             has_ids = True
 
             for record in chunk:
-                data_dict = record.model_dump()
+                data_dict = record.model_dump(mode="json")
                 if self.forensic and user_id is not None:
                     data_dict["create_by"] = user_id
                     data_dict["create_in"] = datetime.now(timezone.utc).isoformat()
@@ -538,7 +550,9 @@ class CollectionRepository:
                 entity = item.get("entity", {})
                 distance = float(item.get("distance", 0.0))
                 rec_id = str(item.get("id", entity.get("id", "")))
-                metadata = {k: v for k, v in entity.items() if k != "vector"}
+                metadata = {
+                    k: v for k, v in entity.items() if k not in ("vector", vector_field_name)
+                }
                 results.append(SearchMatch(id=rec_id, distance=distance, metadata=metadata))
         return results
 
@@ -662,9 +676,9 @@ class CollectionRepository:
         before_item = self.get_by_field(
             id=record_id, partition_names=[partition_name] if partition_name else None
         )
-        data_before = before_item.model_dump() if before_item else None
+        data_before = before_item.model_dump(mode="json") if before_item else None
 
-        data_dict = record.model_dump()
+        data_dict = record.model_dump(mode="json")
         vector_field_name = self.vector_meta["field_name"]
         if self.forensic and user_id is not None:
             data_dict["update_by"] = user_id
@@ -706,7 +720,7 @@ class CollectionRepository:
         before_item = self.get_by_field(
             id=record_id, partition_names=[partition_name] if partition_name else None
         )
-        data_before = before_item.model_dump() if before_item else None
+        data_before = before_item.model_dump(mode="json") if before_item else None
         vector_field_name = self.vector_meta["field_name"]
 
         kwargs: dict[str, Any] = {}
@@ -786,26 +800,37 @@ class WMilvus:
 
     def __init__(
         self,
-        models: Union[type[BaseModel], list[type[BaseModel]]],
-        config: Optional[Union[str, dict[str, Any]]] = None,
-        forensic: bool = False,
+        *args: Any,
         **kwargs: Any,
     ) -> None:
-        if isinstance(config, str):
-            self.uri = config
-            token = kwargs.get("token", "")
-            db_name = kwargs.get("db_name", "default")
-            timeout = kwargs.get("timeout", 30.0)
-        elif isinstance(config, dict):
-            self.uri = config.get("uri", "http://localhost:19530")
-            token = config.get("token", "")
-            db_name = config.get("db_name", "default")
-            timeout = config.get("timeout", 30.0)
+        config = kwargs.pop("config", None)
+        forensic = kwargs.pop("forensic", False)
+        models = None
+        uri = None
+
+        if args:
+            if isinstance(args[0], str):
+                uri = args[0]
+                models = args[1] if len(args) > 1 else kwargs.pop("models", None)
+            else:
+                models = args[0]
+                if len(args) > 1:
+                    config = args[1]
         else:
-            self.uri = kwargs.get("uri", "http://localhost:19530")
-            token = kwargs.get("token", "")
-            db_name = kwargs.get("db_name", "default")
-            timeout = kwargs.get("timeout", 30.0)
+            models = kwargs.pop("models", None)
+
+        if not uri:
+            if isinstance(config, str):
+                uri = config
+            elif isinstance(config, dict):
+                uri = config.get("uri", "http://localhost:19530")
+            else:
+                uri = kwargs.get("uri", "http://localhost:19530")
+
+        self.uri = uri
+        token = kwargs.get("token", "")
+        db_name = kwargs.get("db_name", "default")
+        timeout = kwargs.get("timeout", 30.0)
 
         try:
             self.client = MilvusClient(
