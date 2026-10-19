@@ -623,3 +623,55 @@ def test_search_similar_with_search_params_and_partition(mock_milvus_client: Mag
     search_kwargs = mock_instance.search.call_args.kwargs
     assert search_kwargs["search_params"] == {"ef": 64}
     assert search_kwargs["partition_names"] == ["camera_01"]
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_forensic_datetime_serialization_and_autoload_and_flexible_init(
+    mock_milvus_client: MagicMock,
+) -> None:
+    """Test JSON datetime serialization in insert/update, collection autoload, and flexible init.
+
+    This test validates:
+    1. Flexible WMilvus initialization with URI as first argument and models in kwargs.
+    2. Automatic loading of existing unloaded collections when has_collection returns True.
+    3. ForensicModel datetime fields (create_in, update_in) are serialized to ISO strings
+       in upsert/insert payloads via model_dump(mode='json'), preventing DataNotMatchException.
+    4. Custom vector field names are excluded from SearchMatch.metadata.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.get_load_state.return_value = {"state": "NotLoad"}
+    mock_instance.search.return_value = [
+        [
+            {
+                "id": "1",
+                "distance": 0.95,
+                "entity": {
+                    "id": "1",
+                    "name": "Audit User",
+                    "face_vec": [0.1] * 128,
+                },
+            }
+        ]
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    # 1. Flexible init: uri string first, models list
+    db = WMilvus("http://milvus-server:19530", models=[UserFace])
+    assert db.uri == "http://milvus-server:19530"
+
+    # 2. Check that load_collection was called because get_load_state returned NotLoad
+    mock_instance.load_collection.assert_called_with(collection_name="users_face")
+
+    # 3. Insert and verify payload has string datetime, not datetime object
+    face = UserFace(id="1", name="Audit User", face_vec=[0.1] * 128)
+    db.insert(face)
+    upsert_kwargs = mock_instance.upsert.call_args.kwargs
+    payload = upsert_kwargs["data"][0]
+    assert isinstance(payload["create_in"], str)
+    assert not hasattr(payload["create_in"], "tzinfo")
+
+    # 4. Search and verify custom vector field face_vec is omitted from metadata
+    matches = db.search_similar_with_scores(vector=[0.1] * 128, top_k=1)
+    assert len(matches) == 1
+    assert "face_vec" not in matches[0].metadata
