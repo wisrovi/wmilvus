@@ -29,7 +29,9 @@
 - **Async Client Support (`AsyncWMilvus`)** — Full non-blocking async mirror with `async with` context manager for FastAPI and asyncio applications.
 - **Schema Verification (`verify_schema`)** — Verification of Pydantic model vector dimensions against active Milvus collection schemas.
 - **Single & Multi-Collection ORM Routing** — Automatic collection creation and routing by model class (`db[Model]`), attribute (`db.modelname`), or main client auto-routing (`db.insert(instance)`).
-- **Enterprise Ghost Audit Log (`_forensic_audit_log`)** — Global audit trail tracking `INSERT`, `UPDATE`, `SOFT_DELETE`, and `HARD_DELETE` operations for models inheriting from `ForensicModel`.
+- **Enterprise Ghost Audit Log (`_forensic_audit_log`)** — Global audit trail tracking `INSERT`, `UPDATE`, `SOFT_DELETE`, and `HARD_DELETE` operations for models inheriting from `ForensicModel` with safe JSON ISO-8601 datetime serialization.
+- **Automated Collection Memory Loading** — Transparent auto-loading (`load_collection`) into memory for pre-existing or offline Milvus collections upon connection.
+- **Flexible Client Instantiation** — Versatile initialization supporting `WMilvus(uri, models=[...])`, `WMilvus(models=[...], uri=...)`, and config dictionaries without rigid positional restrictions.
 - **SQLite Vector Backup & Import (`wsqlite`)** — Native ORM-based backup export (`export_to_sqlite`) and restoration (`import_from_sqlite`) powered by `wsqlite`.
 - **Dockerized Test Runner & Coverage** — Out-of-the-box support for isolated container testing (`run_tests_docker.sh`) and HTML coverage reports (`run_coverage.sh`).
 
