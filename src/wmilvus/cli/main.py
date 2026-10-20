@@ -1,6 +1,7 @@
 """CLI interface for WMilvus database management, inspection, backup, and restore."""
 
 import json
+
 import click
 from pymilvus import MilvusClient
 
