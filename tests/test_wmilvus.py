@@ -3,7 +3,7 @@
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from wmilvus import AsyncWMilvus, FieldVector, ForensicModel, WMilvus
 
 
@@ -855,3 +855,197 @@ def test_update_preserves_existing_vector_when_incoming_vector_empty(
     # Check that returned record object has the preserved vector restored
     assert updated_result.embedding == [0.1, 0.2, 0.3, 0.4]
     assert updated_result.age == 31
+
+
+def test_inspect_model_fields_schema_type_mapping() -> None:
+    """Test inspect_model_fields_schema accurately maps all Python/Pydantic types to Milvus DataTypes.
+
+    This test validates:
+    1. Strings map to DataType.VARCHAR with default 65535 or custom max_length constraint.
+    2. Integers map to DataType.INT64 with nullable=True.
+    3. Floats map to DataType.DOUBLE with nullable=True.
+    4. Booleans map to DataType.BOOL with nullable=True.
+    5. List of strings maps to DataType.ARRAY with element_type=DataType.VARCHAR.
+    6. List of integers maps to DataType.ARRAY with element_type=DataType.INT64.
+    7. Dictionaries and arbitrary nested objects map to DataType.JSON.
+    8. Primary key and vector fields are excluded from scalar schema inspection.
+    """
+    from datetime import datetime
+    from typing import Optional
+
+    from pydantic import Field
+    from pymilvus import DataType
+    from wmilvus.core.client import inspect_model_fields_schema
+
+    class ComprehensiveModel(BaseModel):
+        id: str
+        vec: list[float] = FieldVector(dim=128)
+        title: str
+        count: int
+        score: float
+        is_verified: bool
+        tags: list[str] = Field(default_factory=list)
+        scores: list[int] = Field(default_factory=list)
+        metadata: dict[str, Any] = Field(default_factory=dict)
+        created_at: Optional[datetime] = None
+
+    fields = inspect_model_fields_schema(ComprehensiveModel, pk_name="id", vector_field_name="vec")
+    field_map = {f["field_name"]: f for f in fields}
+
+    # Verify primary key and vector field are not in scalar fields
+    assert "id" not in field_map
+    assert "vec" not in field_map
+
+    # Verify VARCHAR mappings
+    assert field_map["title"]["datatype"] == DataType.VARCHAR
+    assert field_map["title"]["max_length"] == 65535
+    assert field_map["title"]["nullable"] is True
+
+    # Verify INT64 mappings
+    assert field_map["count"]["datatype"] == DataType.INT64
+    assert field_map["count"]["nullable"] is True
+
+    # Verify DOUBLE mappings
+    assert field_map["score"]["datatype"] == DataType.DOUBLE
+    assert field_map["score"]["nullable"] is True
+
+    # Verify BOOL mappings
+    assert field_map["is_verified"]["datatype"] == DataType.BOOL
+    assert field_map["is_verified"]["nullable"] is True
+
+    # Verify ARRAY of VARCHAR mappings
+    assert field_map["tags"]["datatype"] == DataType.ARRAY
+    assert field_map["tags"]["element_type"] == DataType.VARCHAR
+    assert field_map["tags"]["max_capacity"] == 4096
+    assert field_map["tags"]["max_length"] == 512
+
+    # Verify ARRAY of INT64 mappings
+    assert field_map["scores"]["datatype"] == DataType.ARRAY
+    assert field_map["scores"]["element_type"] == DataType.INT64
+    assert field_map["scores"]["max_capacity"] == 4096
+
+    # Verify JSON mapping for dict
+    assert field_map["metadata"]["datatype"] == DataType.JSON
+    assert field_map["metadata"]["nullable"] is True
+
+    # Verify datetime maps to VARCHAR(64)
+    assert field_map["created_at"]["datatype"] == DataType.VARCHAR
+    assert field_map["created_at"]["max_length"] == 64
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_ensure_collection_explicit_schema_creation(
+    mock_milvus_client: MagicMock,
+) -> None:
+    """Test _ensure_collection registers all model fields explicitly into Milvus collection schema.
+
+    This test validates:
+    1. When a collection does not exist, create_schema() is invoked with enable_dynamic_field=True.
+    2. Primary key is added with DataType.VARCHAR and max_length=512 (or INT64).
+    3. Vector field is added with DataType.FLOAT_VECTOR and specified dimension.
+    4. Every scalar, array, and json field from the Pydantic model is added via schema.add_field().
+    5. This guarantees that columns are created distinctly in Milvus rather than lumped into dynamic fields.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_schema = MagicMock()
+    mock_instance.create_schema.return_value = mock_schema
+    mock_milvus_client.return_value = mock_instance
+
+    class VideoDTO(BaseModel):
+        id: str
+        path: str
+        summary_text: str
+        summary_embedding: list[float] = FieldVector(dim=384, default_factory=list)
+        frames_ids: list[str] = Field(default_factory=list)
+
+    config = {"uri": "http://localhost:19530"}
+    WMilvus(VideoDTO, config)
+
+    # Check create_schema was called with dynamic fields enabled
+    mock_instance.create_schema.assert_called_once_with(auto_id=False, enable_dynamic_field=True)
+
+    # Check that schema.add_field was called for pk, vector, and each attribute
+    added_field_names = [
+        call.kwargs.get("field_name") for call in mock_schema.add_field.call_args_list
+    ]
+    assert "id" in added_field_names
+    assert "summary_embedding" in added_field_names
+    assert "path" in added_field_names
+    assert "summary_text" in added_field_names
+    assert "frames_ids" in added_field_names
+
+    # Check create_collection was called
+    mock_instance.create_collection.assert_called_once()
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_auto_migration_add_missing_collection_field(
+    mock_milvus_client: MagicMock,
+) -> None:
+    """Test auto-migration when existing collection is missing fields declared in the Pydantic model.
+
+    This test validates:
+    1. When a collection already exists in Milvus, describe_collection is inspected.
+    2. Any fields present in the Pydantic model but missing in the Milvus schema are identified.
+    3. client.add_collection_field() is called with the proper DataType and parameters for each missing field.
+    4. Existing collections seamlessly evolve without requiring manual schema migrations.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    # Existing collection only has 'id' and 'summary_embedding'
+    mock_instance.describe_collection.return_value = {
+        "collection_name": "videodto",
+        "fields": [
+            {"name": "id", "type": 21},
+            {"name": "summary_embedding", "type": 101},
+        ],
+    }
+    mock_milvus_client.return_value = mock_instance
+
+    class VideoDTO(BaseModel):
+        id: str
+        path: str
+        summary_text: str
+        summary_embedding: list[float] = FieldVector(dim=384, default_factory=list)
+        frames_ids: list[str] = Field(default_factory=list)
+
+    config = {"uri": "http://localhost:19530"}
+    WMilvus(VideoDTO, config)
+
+    # Check add_collection_field was called for missing fields: 'path', 'summary_text', 'frames_ids'
+    added_field_names = [
+        call.kwargs.get("field_name") for call in mock_instance.add_collection_field.call_args_list
+    ]
+    assert "path" in added_field_names
+    assert "summary_text" in added_field_names
+    assert "frames_ids" in added_field_names
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_drop_collection_operations(
+    mock_milvus_client: MagicMock,
+) -> None:
+    """Test drop() on repository and drop_collection() on WMilvus client.
+
+    This test validates:
+    1. db.drop_collection(model_cls) calls MilvusClient.drop_collection and evicts repository cache.
+    2. db[model_cls].drop() calls MilvusClient.drop_collection for that repository's collection.
+    3. Clean collection lifecycle management is provided to callers.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    # Test repository drop()
+    db[Person].drop()
+    mock_instance.drop_collection.assert_called_with(collection_name="person")
+
+    # Test client drop_collection()
+    mock_instance.drop_collection.reset_mock()
+    db.drop_collection(Person)
+    mock_instance.drop_collection.assert_called_with(collection_name="person")
+    assert Person not in db.repositories
