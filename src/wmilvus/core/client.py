@@ -11,7 +11,7 @@ import numpy as np
 from loguru import logger
 from pydantic import BaseModel
 from pymilvus import DataType, MilvusClient
-from wmilvus.exceptions import CollectionError, ConnectionError, ValidationError
+from wmilvus.exceptions import CollectionError, ConnectionError, ValidationError, VectorSearchError
 from wmilvus.types import ForensicModel, SearchMatch
 
 GHOST_AUDIT_LOG_COLLECTION = "_forensic_audit_log"
@@ -37,14 +37,26 @@ def inspect_model_vector_field(model_cls: type[BaseModel]) -> dict[str, Any]:
                 "metric_type": json_extra.get("metric_type", "COSINE"),
                 "index_type": json_extra.get("index_type", "HNSW"),
                 "params": json_extra.get("params", {"M": 16, "efConstruction": 200}),
+                "has_vector": True,
             }
-    # Fallback default if no explicit FieldVector is annotated
+    # Fallback if a field is named 'vector' in model fields
+    if "vector" in model_cls.model_fields:
+        return {
+            "field_name": "vector",
+            "dim": 128,
+            "metric_type": "COSINE",
+            "index_type": "HNSW",
+            "params": {"M": 16, "efConstruction": 200},
+            "has_vector": True,
+        }
+    # Pure scalar / non-vector model: provision dummy vector metadata for Milvus compatibility
     return {
-        "field_name": "vector",
-        "dim": 128,
+        "field_name": "_dummy_vector",
+        "dim": 8,
         "metric_type": "COSINE",
-        "index_type": "HNSW",
-        "params": {"M": 16, "efConstruction": 200},
+        "index_type": "FLAT",
+        "params": {},
+        "has_vector": False,
     }
 
 
@@ -348,10 +360,24 @@ class CollectionRepository:
         self.model_cls = model_cls
         self.collection_name = get_model_tablename(model_cls)
         self.vector_meta = inspect_model_vector_field(model_cls)
+        self.has_vector = bool(self.vector_meta.get("has_vector", True))
         self.pk_info = inspect_model_pk_field(model_cls)
         self.forensic = forensic or issubclass(model_cls, ForensicModel)
         self.consistency_level = consistency_level
         self._ensure_collection()
+
+    def _deserialize_record(self, item: dict[str, Any]) -> BaseModel:
+        """Deserialize raw Milvus query dictionary into the bound Pydantic model."""
+        vector_field_name = self.vector_meta["field_name"]
+        obj_data = {
+            k: v for k, v in item.items() if k not in ("vector", "_dummy_vector", vector_field_name)
+        }
+        if self.has_vector:
+            if vector_field_name in item:
+                obj_data[vector_field_name] = item[vector_field_name]
+            elif "vector" in item:
+                obj_data[vector_field_name] = item["vector"]
+        return self.model_cls.model_validate(obj_data)
 
     def _ensure_collection(self) -> None:
         pk_info = self.pk_info
@@ -395,12 +421,14 @@ class CollectionRepository:
                     schema.add_field(**f_info)
 
                 index_params = self.client.prepare_index_params()
-                index_params.add_index(
-                    field_name=vector_field_name,
-                    index_type=self.vector_meta["index_type"],
-                    metric_type=self.vector_meta["metric_type"],
-                    params=self.vector_meta.get("params", {"M": 16, "efConstruction": 200}),
-                )
+                index_kwargs: dict[str, Any] = {
+                    "field_name": vector_field_name,
+                    "index_type": self.vector_meta["index_type"],
+                    "metric_type": self.vector_meta["metric_type"],
+                }
+                if self.vector_meta.get("params"):
+                    index_kwargs["params"] = self.vector_meta["params"]
+                index_params.add_index(**index_kwargs)
 
                 self.client.create_collection(
                     collection_name=self.collection_name,
@@ -420,6 +448,8 @@ class CollectionRepository:
                     id_type=id_type,
                     max_length=512,
                 )
+                if not self.has_vector:
+                    self.vector_meta["field_name"] = "vector"
                 logger.info(
                     f"Created collection '{self.collection_name}' for model {self.model_cls.__name__}"
                 )
@@ -427,17 +457,34 @@ class CollectionRepository:
             try:
                 desc = self.client.describe_collection(collection_name=self.collection_name)
                 if isinstance(desc, dict):
-                    vector_field_name = self.vector_meta["field_name"]
-                    expected_dim = int(self.vector_meta["dim"])
-                    for f in desc.get("fields", []):
-                        if isinstance(f, dict) and f.get("name") in (vector_field_name, "vector"):
-                            coll_dim = f.get("params", {}).get("dim") or f.get("dim")
-                            if coll_dim and int(coll_dim) != expected_dim:
-                                logger.warning(
-                                    f"Dimension mismatch in Milvus collection '{self.collection_name}': "
-                                    f"Existing collection has dim={coll_dim}, but model '{self.model_cls.__name__}' specifies dim={expected_dim}. "
-                                    f"Milvus vector dimensions are immutable. To use dim={expected_dim}, drop the collection (e.g. db.drop_collection({self.model_cls.__name__})) and recreate it."
-                                )
+                    existing_fields_list = desc.get("fields", [])
+                    if self.has_vector:
+                        vector_field_name = self.vector_meta["field_name"]
+                        expected_dim = int(self.vector_meta["dim"])
+                        for f in existing_fields_list:
+                            if isinstance(f, dict) and f.get("name") in (
+                                vector_field_name,
+                                "vector",
+                            ):
+                                coll_dim = f.get("params", {}).get("dim") or f.get("dim")
+                                if coll_dim and int(coll_dim) != expected_dim:
+                                    logger.warning(
+                                        f"Dimension mismatch in Milvus collection '{self.collection_name}': "
+                                        f"Existing collection has dim={coll_dim}, but model '{self.model_cls.__name__}' specifies dim={expected_dim}. "
+                                        f"Milvus vector dimensions are immutable. To use dim={expected_dim}, drop the collection (e.g. db.drop_collection({self.model_cls.__name__})) and recreate it."
+                                    )
+                    else:
+                        for f in existing_fields_list:
+                            if isinstance(f, dict) and (
+                                f.get("type") in (100, 101)
+                                or "vector" in str(f.get("type_name", "")).lower()
+                                or f.get("name") in ("_dummy_vector", "vector")
+                            ):
+                                self.vector_meta["field_name"] = f.get("name")
+                                coll_dim = f.get("params", {}).get("dim") or f.get("dim")
+                                if coll_dim:
+                                    self.vector_meta["dim"] = int(coll_dim)
+                                break
 
                     if hasattr(self.client, "add_collection_field"):
                         existing_fields = {
@@ -502,8 +549,16 @@ class CollectionRepository:
         rec_id = data_dict.get(pk_name)
         has_id = rec_id is not None and rec_id != ""
 
+        vector_val = (
+            data_dict.get(vector_field_name)
+            if self.has_vector
+            else ([0.0] * self.vector_meta["dim"])
+        )
+        if vector_val is None:
+            vector_val = [0.0] * self.vector_meta["dim"]
+
         payload = {
-            vector_field_name: data_dict[vector_field_name],
+            vector_field_name: vector_val,
             **{k: v for k, v in data_dict.items() if k not in (pk_name, vector_field_name)},
         }
         if has_id:
@@ -574,8 +629,16 @@ class CollectionRepository:
                 if not rec_has_id:
                     has_ids = False
 
+                vector_val = (
+                    data_dict.get(vector_field_name)
+                    if self.has_vector
+                    else ([0.0] * self.vector_meta["dim"])
+                )
+                if vector_val is None:
+                    vector_val = [0.0] * self.vector_meta["dim"]
+
                 payload = {
-                    vector_field_name: data_dict[vector_field_name],
+                    vector_field_name: vector_val,
                     **{k: v for k, v in data_dict.items() if k not in (pk_name, vector_field_name)},
                 }
                 if rec_has_id:
@@ -630,7 +693,9 @@ class CollectionRepository:
             kwargs.setdefault("consistency_level", self.consistency_level)
 
         vector_field_name = self.vector_meta["field_name"]
-        if output_fields is None:
+        if not self.has_vector:
+            actual_output_fields = output_fields if output_fields is not None else ["*"]
+        elif output_fields is None:
             actual_output_fields = (
                 ["*", vector_field_name]
                 if include_vector and vector_field_name != "vector"
@@ -646,13 +711,7 @@ class CollectionRepository:
             limit=limit,
             **kwargs,
         )
-        results: list[BaseModel] = []
-        for item in raw_items:
-            obj_data = {k: v for k, v in item.items() if k != "vector"}
-            if "vector" in item:
-                obj_data[vector_field_name] = item["vector"]
-            results.append(self.model_cls.model_validate(obj_data))
-        return results
+        return [self._deserialize_record(item) for item in raw_items]
 
     def get_by_field(
         self,
@@ -672,7 +731,9 @@ class CollectionRepository:
             extra_kwargs.setdefault("consistency_level", self.consistency_level)
 
         vector_field_name = self.vector_meta["field_name"]
-        if output_fields is None:
+        if not self.has_vector:
+            actual_output_fields = output_fields if output_fields is not None else ["*"]
+        elif output_fields is None:
             actual_output_fields = (
                 ["*", vector_field_name]
                 if include_vector and vector_field_name != "vector"
@@ -690,12 +751,7 @@ class CollectionRepository:
         )
         if not raw_items:
             return None
-        item = raw_items[0]
-        vector_field_name = self.vector_meta["field_name"]
-        obj_data = {k: v for k, v in item.items() if k != "vector"}
-        if "vector" in item:
-            obj_data[vector_field_name] = item["vector"]
-        return self.model_cls.model_validate(obj_data)
+        return self._deserialize_record(raw_items[0])
 
     def filter_by(
         self,
@@ -714,7 +770,9 @@ class CollectionRepository:
             extra_kwargs.setdefault("consistency_level", self.consistency_level)
 
         vector_field_name = self.vector_meta["field_name"]
-        if output_fields is None:
+        if not self.has_vector:
+            actual_output_fields = output_fields if output_fields is not None else ["*"]
+        elif output_fields is None:
             actual_output_fields = (
                 ["*", vector_field_name]
                 if include_vector and vector_field_name != "vector"
@@ -730,14 +788,7 @@ class CollectionRepository:
             limit=limit,
             **extra_kwargs,
         )
-        vector_field_name = self.vector_meta["field_name"]
-        results: list[BaseModel] = []
-        for item in raw_items:
-            obj_data = {k: v for k, v in item.items() if k != "vector"}
-            if "vector" in item:
-                obj_data[vector_field_name] = item["vector"]
-            results.append(self.model_cls.model_validate(obj_data))
-        return results
+        return [self._deserialize_record(item) for item in raw_items]
 
     def iter_all(
         self,
@@ -753,7 +804,9 @@ class CollectionRepository:
         if partition_names:
             kwargs["partition_names"] = partition_names
 
-        if output_fields is None:
+        if not self.has_vector:
+            actual_output_fields = output_fields if output_fields is not None else ["*"]
+        elif output_fields is None:
             actual_output_fields = (
                 ["*", vector_field_name]
                 if include_vector and vector_field_name != "vector"
@@ -774,13 +827,7 @@ class CollectionRepository:
                 batch = iterator.next()
                 if not batch:
                     break
-                results = []
-                for item in batch:
-                    obj_data = {k: v for k, v in item.items() if k != "vector"}
-                    if "vector" in item:
-                        obj_data[vector_field_name] = item["vector"]
-                    results.append(self.model_cls.model_validate(obj_data))
-                yield results
+                yield [self._deserialize_record(item) for item in batch]
         finally:
             iterator.close()
 
@@ -795,6 +842,11 @@ class CollectionRepository:
         include_vector: bool = False,
     ) -> list[BaseModel]:
         """Perform vector similarity search returning typed Pydantic model instances."""
+        if not self.has_vector:
+            raise VectorSearchError(
+                f"Model '{self.model_cls.__name__}' does not have a vector field. "
+                "Vector similarity search is not supported on scalar-only models."
+            )
         vec_list = vector.tolist() if isinstance(vector, np.ndarray) else list(vector)
         vector_field_name = self.vector_meta["field_name"]
         kwargs: dict[str, Any] = {}
@@ -827,10 +879,7 @@ class CollectionRepository:
         if search_output and len(search_output) > 0:
             for item in search_output[0]:
                 entity = item.get("entity", {})
-                obj_data = {k: v for k, v in entity.items() if k != "vector"}
-                if "vector" in entity:
-                    obj_data[vector_field_name] = entity["vector"]
-                results.append(self.model_cls.model_validate(obj_data))
+                results.append(self._deserialize_record(entity))
         return results
 
     def search_similar_with_scores(
@@ -842,6 +891,11 @@ class CollectionRepository:
         partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         """Perform vector similarity search returning SearchMatch instances with similarity scores."""
+        if not self.has_vector:
+            raise VectorSearchError(
+                f"Model '{self.model_cls.__name__}' does not have a vector field. "
+                "Vector similarity search is not supported on scalar-only models."
+            )
         vec_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
         vector_field_name = self.vector_meta["field_name"]
         kwargs: dict[str, Any] = {}
@@ -883,6 +937,11 @@ class CollectionRepository:
         partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
         """Perform vector similarity range search filtering by minimum similarity score / radius threshold."""
+        if not self.has_vector:
+            raise VectorSearchError(
+                f"Model '{self.model_cls.__name__}' does not have a vector field. "
+                "Vector range search is not supported on scalar-only models."
+            )
         matches_scores = self.search_range_with_scores(
             vector=vector,
             radius=radius,
@@ -908,6 +967,11 @@ class CollectionRepository:
         partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
         """Perform vector similarity range search returning SearchMatch items above radius score."""
+        if not self.has_vector:
+            raise VectorSearchError(
+                f"Model '{self.model_cls.__name__}' does not have a vector field. "
+                "Vector range search is not supported on scalar-only models."
+            )
         all_matches = self.search_similar_with_scores(
             vector=vector,
             top_k=top_k,
@@ -931,6 +995,11 @@ class CollectionRepository:
         include_vector: bool = False,
     ) -> list[BaseModel]:
         """Perform hybrid similarity search combining dense vector search with text/scalar filtering expressions."""
+        if not self.has_vector:
+            raise VectorSearchError(
+                f"Model '{self.model_cls.__name__}' does not have a vector field. "
+                "Hybrid search is not supported on scalar-only models."
+            )
         combined_filter = filter_expr
         if text_query and text_field:
             text_expr = f'{text_field} like "%{text_query}%"'
@@ -952,10 +1021,19 @@ class CollectionRepository:
             raise ValidationError(f"Collection '{self.collection_name}' does not exist in Milvus")
 
         desc = self.client.describe_collection(collection_name=self.collection_name)
+        fields = desc.get("fields", [])
+
+        if not self.has_vector:
+            return {
+                "status": "VALID",
+                "collection_name": self.collection_name,
+                "has_vector": False,
+                "fields_count": len(fields),
+            }
+
         dim = self.vector_meta["dim"]
         metric_type = self.vector_meta["metric_type"]
 
-        fields = desc.get("fields", [])
         vector_field_found = False
         mismatches = []
 
@@ -1004,27 +1082,31 @@ class CollectionRepository:
         data_dict = record.model_dump(mode="json")
         vector_field_name = self.vector_meta["field_name"]
 
-        # Preserve vector if incoming record has empty/missing vector but existing record has one
-        incoming_vec = data_dict.get(vector_field_name)
-        if (
-            incoming_vec is None or (isinstance(incoming_vec, list) and not incoming_vec)
-        ) and before_item:
-            existing_vec = getattr(before_item, vector_field_name, None)
-            if existing_vec:
-                data_dict[vector_field_name] = (
-                    existing_vec.tolist()
-                    if isinstance(existing_vec, np.ndarray)
-                    else list(existing_vec)
-                )
-                with contextlib.suppress(Exception):
-                    setattr(record, vector_field_name, data_dict[vector_field_name])
+        if not self.has_vector:
+            vector_val = [0.0] * self.vector_meta["dim"]
+        else:
+            # Preserve vector if incoming record has empty/missing vector but existing record has one
+            incoming_vec = data_dict.get(vector_field_name)
+            if (
+                incoming_vec is None or (isinstance(incoming_vec, list) and not incoming_vec)
+            ) and before_item:
+                existing_vec = getattr(before_item, vector_field_name, None)
+                if existing_vec:
+                    incoming_vec = (
+                        existing_vec.tolist()
+                        if isinstance(existing_vec, np.ndarray)
+                        else list(existing_vec)
+                    )
+                    with contextlib.suppress(Exception):
+                        setattr(record, vector_field_name, incoming_vec)
+            vector_val = incoming_vec or ([0.0] * self.vector_meta["dim"])
 
         if self.forensic and user_id is not None:
             data_dict["update_by"] = user_id
             data_dict["update_in"] = datetime.now(timezone.utc).isoformat()
         payload = {
             pk_name: record_id,
-            vector_field_name: data_dict[vector_field_name],
+            vector_field_name: vector_val,
             **{k: v for k, v in data_dict.items() if k not in (pk_name, vector_field_name)},
         }
         kwargs: dict[str, Any] = {}
