@@ -369,6 +369,8 @@ class CollectionRepository:
         self,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         """Query all records from the collection up to the specified limit."""
         kwargs: dict[str, Any] = {}
@@ -377,14 +379,23 @@ class CollectionRepository:
         if self.consistency_level:
             kwargs.setdefault("consistency_level", self.consistency_level)
 
+        vector_field_name = self.vector_meta["field_name"]
+        if output_fields is None:
+            actual_output_fields = (
+                ["*", vector_field_name]
+                if include_vector and vector_field_name != "vector"
+                else (["*", "vector"] if include_vector else ["*"])
+            )
+        else:
+            actual_output_fields = output_fields
+
         raw_items = self.client.query(
             collection_name=self.collection_name,
             filter="",
-            output_fields=["*"],
+            output_fields=actual_output_fields,
             limit=limit,
             **kwargs,
         )
-        vector_field_name = self.vector_meta["field_name"]
         results: list[BaseModel] = []
         for item in raw_items:
             obj_data = {k: v for k, v in item.items() if k != "vector"}
@@ -396,6 +407,8 @@ class CollectionRepository:
     def get_by_field(
         self,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
         **kwargs: Any,
     ) -> Optional[BaseModel]:
         """Fetch a single record matching scalar field kwargs."""
@@ -413,10 +426,20 @@ class CollectionRepository:
         if self.consistency_level:
             extra_kwargs.setdefault("consistency_level", self.consistency_level)
 
+        vector_field_name = self.vector_meta["field_name"]
+        if output_fields is None:
+            actual_output_fields = (
+                ["*", vector_field_name]
+                if include_vector and vector_field_name != "vector"
+                else (["*", "vector"] if include_vector else ["*"])
+            )
+        else:
+            actual_output_fields = output_fields
+
         raw_items = self.client.query(
             collection_name=self.collection_name,
             filter=filter_expr,
-            output_fields=["*"],
+            output_fields=actual_output_fields,
             limit=1,
             **extra_kwargs,
         )
@@ -433,6 +456,8 @@ class CollectionRepository:
         self,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
         **kwargs: Any,
     ) -> list[BaseModel]:
         """Query records using typed keyword arguments (e.g. name='Alice', age__gte=18)."""
@@ -443,10 +468,20 @@ class CollectionRepository:
         if self.consistency_level:
             extra_kwargs.setdefault("consistency_level", self.consistency_level)
 
+        vector_field_name = self.vector_meta["field_name"]
+        if output_fields is None:
+            actual_output_fields = (
+                ["*", vector_field_name]
+                if include_vector and vector_field_name != "vector"
+                else (["*", "vector"] if include_vector else ["*"])
+            )
+        else:
+            actual_output_fields = output_fields
+
         raw_items = self.client.query(
             collection_name=self.collection_name,
             filter=filter_expr,
-            output_fields=["*"],
+            output_fields=actual_output_fields,
             limit=limit,
             **extra_kwargs,
         )
@@ -464,6 +499,8 @@ class CollectionRepository:
         batch_size: int = 1000,
         filter_expr: str = "",
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> Iterator[list[BaseModel]]:
         """Yield batches of typed Pydantic models using native Milvus query iterator."""
         vector_field_name = self.vector_meta["field_name"]
@@ -471,11 +508,20 @@ class CollectionRepository:
         if partition_names:
             kwargs["partition_names"] = partition_names
 
+        if output_fields is None:
+            actual_output_fields = (
+                ["*", vector_field_name]
+                if include_vector and vector_field_name != "vector"
+                else (["*", "vector"] if include_vector else ["*"])
+            )
+        else:
+            actual_output_fields = output_fields
+
         iterator = self.client.query_iterator(
             collection_name=self.collection_name,
             batch_size=batch_size,
             filter=filter_expr,
-            output_fields=["*"],
+            output_fields=actual_output_fields,
             **kwargs,
         )
         try:
@@ -500,9 +546,11 @@ class CollectionRepository:
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         """Perform vector similarity search returning typed Pydantic model instances."""
-        vec_list = vector.tolist() if isinstance(vector, np.ndarray) else vector
+        vec_list = vector.tolist() if isinstance(vector, np.ndarray) else list(vector)
         vector_field_name = self.vector_meta["field_name"]
         kwargs: dict[str, Any] = {}
         if search_params:
@@ -512,12 +560,21 @@ class CollectionRepository:
         if self.consistency_level:
             kwargs.setdefault("consistency_level", self.consistency_level)
 
+        if output_fields is None:
+            actual_output_fields = (
+                ["*", vector_field_name]
+                if include_vector and vector_field_name != "vector"
+                else (["*", "vector"] if include_vector else ["*"])
+            )
+        else:
+            actual_output_fields = output_fields
+
         search_output = self.client.search(
             collection_name=self.collection_name,
             data=[vec_list],
             limit=top_k,
             filter=filter_expr,
-            output_fields=["*"],
+            output_fields=actual_output_fields,
             anns_field=vector_field_name,
             **kwargs,
         )
@@ -625,6 +682,8 @@ class CollectionRepository:
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
         ranker: Optional[Any] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         """Perform hybrid similarity search combining dense vector search with text/scalar filtering expressions."""
         combined_filter = filter_expr
@@ -638,6 +697,8 @@ class CollectionRepository:
             filter_expr=combined_filter,
             search_params=search_params,
             partition_names=partition_names,
+            output_fields=output_fields,
+            include_vector=include_vector,
         )
 
     def verify_schema(self) -> dict[str, Any]:
@@ -695,6 +756,22 @@ class CollectionRepository:
 
         data_dict = record.model_dump(mode="json")
         vector_field_name = self.vector_meta["field_name"]
+
+        # Preserve vector if incoming record has empty/missing vector but existing record has one
+        incoming_vec = data_dict.get(vector_field_name)
+        if (
+            incoming_vec is None or (isinstance(incoming_vec, list) and not incoming_vec)
+        ) and before_item:
+            existing_vec = getattr(before_item, vector_field_name, None)
+            if existing_vec:
+                data_dict[vector_field_name] = (
+                    existing_vec.tolist()
+                    if isinstance(existing_vec, np.ndarray)
+                    else list(existing_vec)
+                )
+                with contextlib.suppress(Exception):
+                    setattr(record, vector_field_name, data_dict[vector_field_name])
+
         if self.forensic and user_id is not None:
             data_dict["update_by"] = user_id
             data_dict["update_in"] = datetime.now(timezone.utc).isoformat()
@@ -921,10 +998,17 @@ class WMilvus:
         self,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.get_all(limit=limit, partition_names=partition_names)
+            return single_repo.get_all(
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
         raise CollectionError(
             "get_all() on main WMilvus instance is only valid in single-collection mode"
         )
@@ -932,11 +1016,18 @@ class WMilvus:
     def get_by_field(
         self,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
         **kwargs: Any,
     ) -> Optional[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.get_by_field(partition_names=partition_names, **kwargs)
+            return single_repo.get_by_field(
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
         raise CollectionError(
             "get_by_field() on main WMilvus instance is only valid in single-collection mode"
         )
@@ -945,11 +1036,19 @@ class WMilvus:
         self,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
         **kwargs: Any,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return single_repo.filter_by(limit=limit, partition_names=partition_names, **kwargs)
+            return single_repo.filter_by(
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
         raise CollectionError(
             "filter_by() on main WMilvus instance is only valid in single-collection mode"
         )
@@ -959,11 +1058,17 @@ class WMilvus:
         batch_size: int = 1000,
         filter_expr: str = "",
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> Iterator[list[BaseModel]]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             yield from single_repo.iter_all(
-                batch_size=batch_size, filter_expr=filter_expr, partition_names=partition_names
+                batch_size=batch_size,
+                filter_expr=filter_expr,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
             )
         else:
             raise CollectionError(
@@ -977,6 +1082,8 @@ class WMilvus:
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
@@ -986,6 +1093,8 @@ class WMilvus:
                 filter_expr=filter_expr,
                 search_params=search_params,
                 partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
             )
         raise CollectionError(
             "search_similar() on main WMilvus instance is only valid in single-collection mode"
@@ -1068,6 +1177,8 @@ class WMilvus:
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
         ranker: Optional[Any] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
@@ -1080,6 +1191,8 @@ class WMilvus:
                 search_params=search_params,
                 partition_names=partition_names,
                 ranker=ranker,
+                output_fields=output_fields,
+                include_vector=include_vector,
             )
         raise CollectionError(
             "search_hybrid() on main WMilvus instance is only valid in single-collection mode"
@@ -1208,28 +1321,47 @@ class AsyncCollectionRepository:
         self,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         return await asyncio.to_thread(
-            self._repo.get_all, limit=limit, partition_names=partition_names
+            self._repo.get_all,
+            limit=limit,
+            partition_names=partition_names,
+            output_fields=output_fields,
+            include_vector=include_vector,
         )
 
     async def get_by_field(
         self,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
         **kwargs: Any,
     ) -> Optional[BaseModel]:
         return await asyncio.to_thread(
-            self._repo.get_by_field, partition_names=partition_names, **kwargs
+            self._repo.get_by_field,
+            partition_names=partition_names,
+            output_fields=output_fields,
+            include_vector=include_vector,
+            **kwargs,
         )
 
     async def filter_by(
         self,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
         **kwargs: Any,
     ) -> list[BaseModel]:
         return await asyncio.to_thread(
-            self._repo.filter_by, limit=limit, partition_names=partition_names, **kwargs
+            self._repo.filter_by,
+            limit=limit,
+            partition_names=partition_names,
+            output_fields=output_fields,
+            include_vector=include_vector,
+            **kwargs,
         )
 
     async def search_similar(
@@ -1239,6 +1371,8 @@ class AsyncCollectionRepository:
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         return await asyncio.to_thread(
             self._repo.search_similar,
@@ -1247,6 +1381,8 @@ class AsyncCollectionRepository:
             filter_expr=filter_expr,
             search_params=search_params,
             partition_names=partition_names,
+            output_fields=output_fields,
+            include_vector=include_vector,
         )
 
     async def search_similar_with_scores(
@@ -1314,6 +1450,8 @@ class AsyncCollectionRepository:
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
         ranker: Optional[Any] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         return await asyncio.to_thread(
             self._repo.search_hybrid,
@@ -1325,6 +1463,8 @@ class AsyncCollectionRepository:
             search_params=search_params,
             partition_names=partition_names,
             ranker=ranker,
+            output_fields=output_fields,
+            include_vector=include_vector,
         )
 
     async def verify_schema(self) -> dict[str, Any]:
@@ -1441,10 +1581,17 @@ class AsyncWMilvus:
         self,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.get_all(limit=limit, partition_names=partition_names)
+            return await single_repo.get_all(
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
         raise CollectionError(
             "get_all() on main AsyncWMilvus instance is only valid in single-collection mode"
         )
@@ -1452,11 +1599,18 @@ class AsyncWMilvus:
     async def get_by_field(
         self,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
         **kwargs: Any,
     ) -> Optional[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
-            return await single_repo.get_by_field(partition_names=partition_names, **kwargs)
+            return await single_repo.get_by_field(
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
         raise CollectionError(
             "get_by_field() on main AsyncWMilvus instance is only valid in single-collection mode"
         )
@@ -1465,12 +1619,18 @@ class AsyncWMilvus:
         self,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
         **kwargs: Any,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.filter_by(
-                limit=limit, partition_names=partition_names, **kwargs
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
             )
         raise CollectionError(
             "filter_by() on main AsyncWMilvus instance is only valid in single-collection mode"
@@ -1483,6 +1643,8 @@ class AsyncWMilvus:
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
@@ -1492,6 +1654,8 @@ class AsyncWMilvus:
                 filter_expr=filter_expr,
                 search_params=search_params,
                 partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
             )
         raise CollectionError(
             "search_similar() on main AsyncWMilvus instance is only valid in single-collection mode"
@@ -1574,6 +1738,8 @@ class AsyncWMilvus:
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
         ranker: Optional[Any] = None,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = False,
     ) -> list[BaseModel]:
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
@@ -1586,6 +1752,8 @@ class AsyncWMilvus:
                 search_params=search_params,
                 partition_names=partition_names,
                 ranker=ranker,
+                output_fields=output_fields,
+                include_vector=include_vector,
             )
         raise CollectionError(
             "search_hybrid() on main AsyncWMilvus instance is only valid in single-collection mode"
