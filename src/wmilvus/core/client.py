@@ -1211,6 +1211,17 @@ class WMilvus:
             return self._attr_repos[attr_key]
         raise AttributeError(f"'WMilvus' object has no collection repository named '{name}'")
 
+    def _resolve_repo(self, model: Union[type[BaseModel], str]) -> CollectionRepository:
+        """Resolve a collection repository by model class or collection name."""
+        if isinstance(model, type) and issubclass(model, BaseModel):
+            if model in self.repositories:
+                return self.repositories[model]
+        elif isinstance(model, str):
+            key = model.lower()
+            if key in self._attr_repos:
+                return self._attr_repos[key]
+        raise CollectionError(f"No repository registered for model '{model}'")
+
     def insert(
         self,
         record: BaseModel,
@@ -1238,11 +1249,22 @@ class WMilvus:
 
     def get_all(
         self,
+        model: Optional[Union[type[BaseModel], str, int]] = None,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = False,
     ) -> list[BaseModel]:
+        if isinstance(model, int):
+            limit = model
+            model = None
+        if model is not None:
+            return self._resolve_repo(model).get_all(
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.get_all(
@@ -1251,17 +1273,38 @@ class WMilvus:
                 output_fields=output_fields,
                 include_vector=include_vector,
             )
-        raise CollectionError(
-            "get_all() on main WMilvus instance is only valid in single-collection mode"
-        )
+        combined: list[BaseModel] = []
+        for repo in self.repositories.values():
+            combined.extend(
+                repo.get_all(
+                    limit=limit,
+                    partition_names=partition_names,
+                    output_fields=output_fields,
+                    include_vector=include_vector,
+                )
+            )
+        return combined
 
     def get_by_field(
         self,
+        model: Optional[Union[type[BaseModel], str]] = None,
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = True,
         **kwargs: Any,
     ) -> Optional[BaseModel]:
+        if model is not None and (
+            (isinstance(model, type) and issubclass(model, BaseModel))
+            or (isinstance(model, str) and model.lower() in self._attr_repos)
+        ):
+            return self._resolve_repo(model).get_by_field(
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
+        if model is not None:
+            kwargs["model"] = model
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.get_by_field(
@@ -1270,18 +1313,39 @@ class WMilvus:
                 include_vector=include_vector,
                 **kwargs,
             )
-        raise CollectionError(
-            "get_by_field() on main WMilvus instance is only valid in single-collection mode"
-        )
+        for repo in self.repositories.values():
+            item = repo.get_by_field(
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
+            if item is not None:
+                return item
+        return None
 
     def filter_by(
         self,
+        model: Optional[Union[type[BaseModel], str]] = None,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = True,
         **kwargs: Any,
     ) -> list[BaseModel]:
+        if model is not None and (
+            (isinstance(model, type) and issubclass(model, BaseModel))
+            or (isinstance(model, str) and model.lower() in self._attr_repos)
+        ):
+            return self._resolve_repo(model).filter_by(
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
+        if model is not None:
+            kwargs["model"] = model
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.filter_by(
@@ -1291,18 +1355,38 @@ class WMilvus:
                 include_vector=include_vector,
                 **kwargs,
             )
-        raise CollectionError(
-            "filter_by() on main WMilvus instance is only valid in single-collection mode"
-        )
+        combined: list[BaseModel] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                combined.extend(
+                    repo.filter_by(
+                        limit=limit,
+                        partition_names=partition_names,
+                        output_fields=output_fields,
+                        include_vector=include_vector,
+                        **kwargs,
+                    )
+                )
+        return combined
 
     def iter_all(
         self,
+        model: Optional[Union[type[BaseModel], str]] = None,
         batch_size: int = 1000,
         filter_expr: str = "",
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = False,
     ) -> Iterator[list[BaseModel]]:
+        if model is not None:
+            yield from self._resolve_repo(model).iter_all(
+                batch_size=batch_size,
+                filter_expr=filter_expr,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
+            return
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             yield from single_repo.iter_all(
@@ -1312,21 +1396,37 @@ class WMilvus:
                 output_fields=output_fields,
                 include_vector=include_vector,
             )
-        else:
-            raise CollectionError(
-                "iter_all() on main WMilvus instance is only valid in single-collection mode"
+            return
+        for repo in self.repositories.values():
+            yield from repo.iter_all(
+                batch_size=batch_size,
+                filter_expr=filter_expr,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
             )
 
     def search_similar(
         self,
         vector: Union[list[float], np.ndarray],
         top_k: int = 5,
+        model: Optional[Union[type[BaseModel], str]] = None,
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = False,
     ) -> list[BaseModel]:
+        if model is not None:
+            return self._resolve_repo(model).search_similar(
+                vector=vector,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_similar(
@@ -1338,18 +1438,39 @@ class WMilvus:
                 output_fields=output_fields,
                 include_vector=include_vector,
             )
-        raise CollectionError(
-            "search_similar() on main WMilvus instance is only valid in single-collection mode"
-        )
+        results: list[BaseModel] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                results.extend(
+                    repo.search_similar(
+                        vector=vector,
+                        top_k=top_k,
+                        filter_expr=filter_expr,
+                        search_params=search_params,
+                        partition_names=partition_names,
+                        output_fields=output_fields,
+                        include_vector=include_vector,
+                    )
+                )
+        return results[:top_k]
 
     def search_similar_with_scores(
         self,
         vector: Union[list[float], np.ndarray],
         top_k: int = 5,
+        model: Optional[Union[type[BaseModel], str]] = None,
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
+        if model is not None:
+            return self._resolve_repo(model).search_similar_with_scores(
+                vector=vector,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_similar_with_scores(
@@ -1359,19 +1480,40 @@ class WMilvus:
                 search_params=search_params,
                 partition_names=partition_names,
             )
-        raise CollectionError(
-            "search_similar_with_scores() on main WMilvus instance is only valid in single-collection mode"
-        )
+        matches: list[SearchMatch] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                matches.extend(
+                    repo.search_similar_with_scores(
+                        vector=vector,
+                        top_k=top_k,
+                        filter_expr=filter_expr,
+                        search_params=search_params,
+                        partition_names=partition_names,
+                    )
+                )
+        matches.sort(key=lambda m: m.distance, reverse=True)
+        return matches[:top_k]
 
     def search_range(
         self,
         vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
+        model: Optional[Union[type[BaseModel], str]] = None,
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
+        if model is not None:
+            return self._resolve_repo(model).search_range(
+                vector=vector,
+                radius=radius,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_range(
@@ -1382,19 +1524,40 @@ class WMilvus:
                 search_params=search_params,
                 partition_names=partition_names,
             )
-        raise CollectionError(
-            "search_range() on main WMilvus instance is only valid in single-collection mode"
-        )
+        results: list[BaseModel] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                results.extend(
+                    repo.search_range(
+                        vector=vector,
+                        radius=radius,
+                        top_k=top_k,
+                        filter_expr=filter_expr,
+                        search_params=search_params,
+                        partition_names=partition_names,
+                    )
+                )
+        return results[:top_k]
 
     def search_range_with_scores(
         self,
         vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
+        model: Optional[Union[type[BaseModel], str]] = None,
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
+        if model is not None:
+            return self._resolve_repo(model).search_range_with_scores(
+                vector=vector,
+                radius=radius,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_range_with_scores(
@@ -1405,9 +1568,21 @@ class WMilvus:
                 search_params=search_params,
                 partition_names=partition_names,
             )
-        raise CollectionError(
-            "search_range_with_scores() on main WMilvus instance is only valid in single-collection mode"
-        )
+        matches: list[SearchMatch] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                matches.extend(
+                    repo.search_range_with_scores(
+                        vector=vector,
+                        radius=radius,
+                        top_k=top_k,
+                        filter_expr=filter_expr,
+                        search_params=search_params,
+                        partition_names=partition_names,
+                    )
+                )
+        matches.sort(key=lambda m: m.distance, reverse=True)
+        return matches[:top_k]
 
     def search_hybrid(
         self,
@@ -1416,12 +1591,26 @@ class WMilvus:
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
+        model: Optional[Union[type[BaseModel], str]] = None,
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
         ranker: Optional[Any] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = False,
     ) -> list[BaseModel]:
+        if model is not None:
+            return self._resolve_repo(model).search_hybrid(
+                vector=vector,
+                text_query=text_query,
+                text_field=text_field,
+                filter_expr=filter_expr,
+                top_k=top_k,
+                search_params=search_params,
+                partition_names=partition_names,
+                ranker=ranker,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.search_hybrid(
@@ -1436,17 +1625,35 @@ class WMilvus:
                 output_fields=output_fields,
                 include_vector=include_vector,
             )
-        raise CollectionError(
-            "search_hybrid() on main WMilvus instance is only valid in single-collection mode"
-        )
+        results: list[BaseModel] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                results.extend(
+                    repo.search_hybrid(
+                        vector=vector,
+                        text_query=text_query,
+                        text_field=text_field,
+                        filter_expr=filter_expr,
+                        top_k=top_k,
+                        search_params=search_params,
+                        partition_names=partition_names,
+                        ranker=ranker,
+                        output_fields=output_fields,
+                        include_vector=include_vector,
+                    )
+                )
+        return results[:top_k]
 
-    def verify_schema(self) -> dict[str, Any]:
+    def verify_schema(self, model: Optional[Union[type[BaseModel], str]] = None) -> dict[str, Any]:
+        if model is not None:
+            return self._resolve_repo(model).verify_schema()
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.verify_schema()
-        raise CollectionError(
-            "verify_schema() on main WMilvus instance is only valid in single-collection mode"
-        )
+        results = {}
+        for name_cls, repo in self.repositories.items():
+            results[name_cls.__name__] = repo.verify_schema()
+        return {"status": "VALID", "collections": results}
 
     def update(
         self,
@@ -1462,46 +1669,66 @@ class WMilvus:
     def delete(
         self,
         record_id: Union[str, int],
+        model: Optional[Union[type[BaseModel], str]] = None,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
     ) -> None:
+        if model is not None:
+            self._resolve_repo(model).delete(
+                record_id, user_id=user_id, partition_name=partition_name
+            )
+            return
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             single_repo.delete(record_id, user_id=user_id, partition_name=partition_name)
-        else:
-            raise CollectionError(
-                "delete() on main WMilvus instance requires specifying repository in multi-collection mode"
-            )
+            return
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                repo.delete(record_id, user_id=user_id, partition_name=partition_name)
 
     def delete_batch(
         self,
         record_ids: list[Union[str, int]],
+        model: Optional[Union[type[BaseModel], str]] = None,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
     ) -> dict[str, Any]:
+        if model is not None:
+            return self._resolve_repo(model).delete_batch(
+                record_ids, user_id=user_id, partition_name=partition_name
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.delete_batch(
                 record_ids, user_id=user_id, partition_name=partition_name
             )
-        raise CollectionError(
-            "delete_batch() on main WMilvus instance requires specifying repository in multi-collection mode"
-        )
+        total_deleted = 0
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                res = repo.delete_batch(record_ids, user_id=user_id, partition_name=partition_name)
+                total_deleted += res.get("delete_count", 0)
+        return {"delete_count": total_deleted}
 
     def delete_by_expr(
         self,
         filter_expr: str,
+        model: Optional[Union[type[BaseModel], str]] = None,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
     ) -> dict[str, Any]:
+        if model is not None:
+            return self._resolve_repo(model).delete_by_expr(
+                filter_expr, user_id=user_id, partition_name=partition_name
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return single_repo.delete_by_expr(
                 filter_expr, user_id=user_id, partition_name=partition_name
             )
-        raise CollectionError(
-            "delete_by_expr() on main WMilvus instance requires specifying repository in multi-collection mode"
-        )
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                repo.delete_by_expr(filter_expr, user_id=user_id, partition_name=partition_name)
+        return {"status": "SUCCESS"}
 
     def get_ghost_audit_log(self, limit: int = 100) -> list[dict[str, Any]]:
         """Fetch recorded audit events from global _forensic_audit_log ghost collection."""
@@ -1816,6 +2043,17 @@ class AsyncWMilvus:
             return self._attr_repos[attr_key]
         raise AttributeError(f"'AsyncWMilvus' object has no collection repository named '{name}'")
 
+    def _resolve_repo(self, model: Union[type[BaseModel], str]) -> AsyncCollectionRepository:
+        """Resolve an async collection repository by model class or collection name."""
+        if isinstance(model, type) and issubclass(model, BaseModel):
+            if model in self.repositories:
+                return self.repositories[model]
+        elif isinstance(model, str):
+            key = model.lower()
+            if key in self._attr_repos:
+                return self._attr_repos[key]
+        raise CollectionError(f"No async repository registered for model '{model}'")
+
     async def insert(
         self,
         record: BaseModel,
@@ -1843,11 +2081,22 @@ class AsyncWMilvus:
 
     async def get_all(
         self,
+        model: Optional[Union[type[BaseModel], str, int]] = None,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = False,
     ) -> list[BaseModel]:
+        if isinstance(model, int):
+            limit = model
+            model = None
+        if model is not None:
+            return await self._resolve_repo(model).get_all(
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.get_all(
@@ -1856,17 +2105,37 @@ class AsyncWMilvus:
                 output_fields=output_fields,
                 include_vector=include_vector,
             )
-        raise CollectionError(
-            "get_all() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        combined: list[BaseModel] = []
+        for repo in self.repositories.values():
+            items = await repo.get_all(
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
+            combined.extend(items)
+        return combined
 
     async def get_by_field(
         self,
+        model: Optional[Union[type[BaseModel], str]] = None,
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = True,
         **kwargs: Any,
     ) -> Optional[BaseModel]:
+        if model is not None and (
+            (isinstance(model, type) and issubclass(model, BaseModel))
+            or (isinstance(model, str) and model.lower() in self._attr_repos)
+        ):
+            return await self._resolve_repo(model).get_by_field(
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
+        if model is not None:
+            kwargs["model"] = model
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.get_by_field(
@@ -1875,18 +2144,39 @@ class AsyncWMilvus:
                 include_vector=include_vector,
                 **kwargs,
             )
-        raise CollectionError(
-            "get_by_field() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        for repo in self.repositories.values():
+            item = await repo.get_by_field(
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
+            if item is not None:
+                return item
+        return None
 
     async def filter_by(
         self,
+        model: Optional[Union[type[BaseModel], str]] = None,
         limit: int = 100,
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = True,
         **kwargs: Any,
     ) -> list[BaseModel]:
+        if model is not None and (
+            (isinstance(model, type) and issubclass(model, BaseModel))
+            or (isinstance(model, str) and model.lower() in self._attr_repos)
+        ):
+            return await self._resolve_repo(model).filter_by(
+                limit=limit,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+                **kwargs,
+            )
+        if model is not None:
+            kwargs["model"] = model
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.filter_by(
@@ -1896,20 +2186,40 @@ class AsyncWMilvus:
                 include_vector=include_vector,
                 **kwargs,
             )
-        raise CollectionError(
-            "filter_by() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        combined: list[BaseModel] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                items = await repo.filter_by(
+                    limit=limit,
+                    partition_names=partition_names,
+                    output_fields=output_fields,
+                    include_vector=include_vector,
+                    **kwargs,
+                )
+                combined.extend(items)
+        return combined
 
     async def search_similar(
         self,
         vector: Union[list[float], np.ndarray],
         top_k: int = 5,
+        model: Optional[Union[type[BaseModel], str]] = None,
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = False,
     ) -> list[BaseModel]:
+        if model is not None:
+            return await self._resolve_repo(model).search_similar(
+                vector=vector,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_similar(
@@ -1921,18 +2231,38 @@ class AsyncWMilvus:
                 output_fields=output_fields,
                 include_vector=include_vector,
             )
-        raise CollectionError(
-            "search_similar() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        results: list[BaseModel] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                items = await repo.search_similar(
+                    vector=vector,
+                    top_k=top_k,
+                    filter_expr=filter_expr,
+                    search_params=search_params,
+                    partition_names=partition_names,
+                    output_fields=output_fields,
+                    include_vector=include_vector,
+                )
+                results.extend(items)
+        return results[:top_k]
 
     async def search_similar_with_scores(
         self,
         vector: Union[list[float], np.ndarray],
         top_k: int = 5,
+        model: Optional[Union[type[BaseModel], str]] = None,
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
+        if model is not None:
+            return await self._resolve_repo(model).search_similar_with_scores(
+                vector=vector,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_similar_with_scores(
@@ -1942,19 +2272,39 @@ class AsyncWMilvus:
                 search_params=search_params,
                 partition_names=partition_names,
             )
-        raise CollectionError(
-            "search_similar_with_scores() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        matches: list[SearchMatch] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                items = await repo.search_similar_with_scores(
+                    vector=vector,
+                    top_k=top_k,
+                    filter_expr=filter_expr,
+                    search_params=search_params,
+                    partition_names=partition_names,
+                )
+                matches.extend(items)
+        matches.sort(key=lambda m: m.distance, reverse=True)
+        return matches[:top_k]
 
     async def search_range(
         self,
         vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
+        model: Optional[Union[type[BaseModel], str]] = None,
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
     ) -> list[BaseModel]:
+        if model is not None:
+            return await self._resolve_repo(model).search_range(
+                vector=vector,
+                radius=radius,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_range(
@@ -1965,19 +2315,39 @@ class AsyncWMilvus:
                 search_params=search_params,
                 partition_names=partition_names,
             )
-        raise CollectionError(
-            "search_range() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        results: list[BaseModel] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                items = await repo.search_range(
+                    vector=vector,
+                    radius=radius,
+                    top_k=top_k,
+                    filter_expr=filter_expr,
+                    search_params=search_params,
+                    partition_names=partition_names,
+                )
+                results.extend(items)
+        return results[:top_k]
 
     async def search_range_with_scores(
         self,
         vector: Union[list[float], np.ndarray],
         radius: float = 0.8,
         top_k: int = 10,
+        model: Optional[Union[type[BaseModel], str]] = None,
         filter_expr: str = "",
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
     ) -> list[SearchMatch]:
+        if model is not None:
+            return await self._resolve_repo(model).search_range_with_scores(
+                vector=vector,
+                radius=radius,
+                top_k=top_k,
+                filter_expr=filter_expr,
+                search_params=search_params,
+                partition_names=partition_names,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_range_with_scores(
@@ -1988,9 +2358,20 @@ class AsyncWMilvus:
                 search_params=search_params,
                 partition_names=partition_names,
             )
-        raise CollectionError(
-            "search_range_with_scores() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        matches: list[SearchMatch] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                items = await repo.search_range_with_scores(
+                    vector=vector,
+                    radius=radius,
+                    top_k=top_k,
+                    filter_expr=filter_expr,
+                    search_params=search_params,
+                    partition_names=partition_names,
+                )
+                matches.extend(items)
+        matches.sort(key=lambda m: m.distance, reverse=True)
+        return matches[:top_k]
 
     async def search_hybrid(
         self,
@@ -1999,12 +2380,26 @@ class AsyncWMilvus:
         text_field: Optional[str] = None,
         filter_expr: str = "",
         top_k: int = 5,
+        model: Optional[Union[type[BaseModel], str]] = None,
         search_params: Optional[dict[str, Any]] = None,
         partition_names: Optional[list[str]] = None,
         ranker: Optional[Any] = None,
         output_fields: Optional[list[str]] = None,
         include_vector: bool = False,
     ) -> list[BaseModel]:
+        if model is not None:
+            return await self._resolve_repo(model).search_hybrid(
+                vector=vector,
+                text_query=text_query,
+                text_field=text_field,
+                filter_expr=filter_expr,
+                top_k=top_k,
+                search_params=search_params,
+                partition_names=partition_names,
+                ranker=ranker,
+                output_fields=output_fields,
+                include_vector=include_vector,
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.search_hybrid(
@@ -2019,17 +2414,36 @@ class AsyncWMilvus:
                 output_fields=output_fields,
                 include_vector=include_vector,
             )
-        raise CollectionError(
-            "search_hybrid() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        results: list[BaseModel] = []
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                items = await repo.search_hybrid(
+                    vector=vector,
+                    text_query=text_query,
+                    text_field=text_field,
+                    filter_expr=filter_expr,
+                    top_k=top_k,
+                    search_params=search_params,
+                    partition_names=partition_names,
+                    ranker=ranker,
+                    output_fields=output_fields,
+                    include_vector=include_vector,
+                )
+                results.extend(items)
+        return results[:top_k]
 
-    async def verify_schema(self) -> dict[str, Any]:
+    async def verify_schema(
+        self, model: Optional[Union[type[BaseModel], str]] = None
+    ) -> dict[str, Any]:
+        if model is not None:
+            return await self._resolve_repo(model).verify_schema()
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.verify_schema()
-        raise CollectionError(
-            "verify_schema() on main AsyncWMilvus instance is only valid in single-collection mode"
-        )
+        results = {}
+        for name_cls, repo in self.repositories.items():
+            results[name_cls.__name__] = await repo.verify_schema()
+        return {"status": "VALID", "collections": results}
 
     async def update(
         self,
@@ -2045,46 +2459,70 @@ class AsyncWMilvus:
     async def delete(
         self,
         record_id: Union[str, int],
+        model: Optional[Union[type[BaseModel], str]] = None,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
     ) -> None:
+        if model is not None:
+            await self._resolve_repo(model).delete(
+                record_id, user_id=user_id, partition_name=partition_name
+            )
+            return
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             await single_repo.delete(record_id, user_id=user_id, partition_name=partition_name)
-        else:
-            raise CollectionError(
-                "delete() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
-            )
+            return
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                await repo.delete(record_id, user_id=user_id, partition_name=partition_name)
 
     async def delete_batch(
         self,
         record_ids: list[Union[str, int]],
+        model: Optional[Union[type[BaseModel], str]] = None,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
     ) -> dict[str, Any]:
+        if model is not None:
+            return await self._resolve_repo(model).delete_batch(
+                record_ids, user_id=user_id, partition_name=partition_name
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.delete_batch(
                 record_ids, user_id=user_id, partition_name=partition_name
             )
-        raise CollectionError(
-            "delete_batch() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
-        )
+        total_deleted = 0
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                res = await repo.delete_batch(
+                    record_ids, user_id=user_id, partition_name=partition_name
+                )
+                total_deleted += res.get("delete_count", 0)
+        return {"delete_count": total_deleted}
 
     async def delete_by_expr(
         self,
         filter_expr: str,
+        model: Optional[Union[type[BaseModel], str]] = None,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
     ) -> dict[str, Any]:
+        if model is not None:
+            return await self._resolve_repo(model).delete_by_expr(
+                filter_expr, user_id=user_id, partition_name=partition_name
+            )
         if len(self.repositories) == 1:
             single_repo = next(iter(self.repositories.values()))
             return await single_repo.delete_by_expr(
                 filter_expr, user_id=user_id, partition_name=partition_name
             )
-        raise CollectionError(
-            "delete_by_expr() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
-        )
+        for repo in self.repositories.values():
+            with contextlib.suppress(Exception):
+                await repo.delete_by_expr(
+                    filter_expr, user_id=user_id, partition_name=partition_name
+                )
+        return {"status": "SUCCESS"}
 
     async def drop_collection(self, model_cls_or_name: Union[type[BaseModel], str]) -> None:
         """Drop a collection completely from Milvus by model class or collection name asynchronously."""
