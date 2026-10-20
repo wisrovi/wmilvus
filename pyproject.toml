@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "wmilvus"
-version = "0.4.4"
+version = "0.4.5"
 authors = [
     { name = "WILLIAM R.", email = "wisrovi.rodriguez@gmail.com" },
 ]
@@ -51,6 +51,9 @@ Homepage = "https://github.com/wisrovi/wmilvus"
 Documentation = "https://github.com/wisrovi/wmilvus#readme"
 Repository = "https://github.com/wisrovi/wmilvus"
 Issues = "https://github.com/wisrovi/wmilvus/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 100
