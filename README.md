@@ -17,12 +17,14 @@
 ## Key Features
 
 - **Pydantic Model Declarations** — Define collections as standard Pydantic models with vector annotations (`FieldVector`, `MetricType`, `IndexType`). `FieldVector` automatically defaults to `default_factory=list` to prevent missing field validation errors during deserialization.
+- **Explicit Schema Generation & Auto-Migration** — Every attribute defined in your Pydantic model (`str`, `int`, `float`, `bool`, `list[str]`, `list[int]`, `dict`, `datetime`) is automatically mapped to dedicated Milvus columns (`VARCHAR`, `INT64`, `DOUBLE`, `BOOL`, `ARRAY`, `JSON`) rather than falling into generic dynamic fields (`$meta`). Existing collections automatically evolve by auto-adding missing columns (`add_collection_field`) upon client initialization.
+- **Collection Lifecycle & Dropping (`drop`, `drop_collection`)** — Conveniently drop collections from Milvus via `db[Model].drop()` or `db.drop_collection(Model)` across synchronous and asynchronous clients.
 - **Automatic Vector Retrieval & Preservation** — Query methods (`get_by_field`, `filter_by`) automatically include vector fields by default (`include_vector=True`). Calling `update()` with an empty vector automatically preserves the pre-existing vector from Milvus, eliminating dimension mismatch crashes on partial or metadata-only updates.
 - **Dynamic Vector Fields & Auto-ID** — Native payload generation supporting custom vector attribute names (`embedding`, `face_vec`, etc.) and automated `INT64` primary key generation without requiring manual IDs.
 - **Universal Primary Key Support** — Full compatibility with both auto-increment integer (`INT64`) and string (`VARCHAR`) primary keys across all CRUD, filtering, and search routines.
 - **Collection Partitioning & Multi-Tenancy** — Route insertions, queries, and searches to specific Milvus partitions (`partition_name` / `partition_names`).
 - **High-Scale Streaming Iterators (`iter_all`)** — Memory-efficient batch streaming across millions of vectors using native Milvus query iterators.
-- **Typed Filter Query Builder (`filter_by`)** — Declarative keyword querying with comparison operators (`age__gte=18`, `status__in=[1, 2]`, `dni='00000000P'`).
+- **Typed Filter Query Builder (`filter_by`)** — Declarative keyword querying with comparison operators (`age__gte=18`, `status__in=[1, 2]`, `frames_ids__contains='f1'`, `dni='00000000P'`).
 - **Vector Similarity & Range Search** — KNN similarity search (`search_similar`), similarity distance scores (`search_similar_with_scores`), and similarity range threshold search (`search_range`) with customizable search index parameters (`search_params`).
 - **Batch & Expression Deletion** — Flexible record removal via single ID (`delete`), batch IDs (`delete_batch`), or scalar filter expressions (`delete_by_expr`).
 - **Multi-Vector & Hybrid Search Rankers** — Dense + scalar hybrid search with direct support for Milvus rerankers (`RRFRanker`, `WeightedRanker`).
@@ -57,10 +59,12 @@ from typing import List
 from pydantic import BaseModel
 from wmilvus import FieldVector, MetricType, WMilvus
 
+
 class UserFace(BaseModel):
     id: str
     name: str
     face_embedding: List[float] = FieldVector(dim=128, metric_type=MetricType.COSINE)
+
 
 # Context Manager Usage
 with WMilvus(UserFace, uri="http://localhost:19530") as db:
@@ -84,15 +88,18 @@ import asyncio
 from wmilvus import AsyncWMilvus, FieldVector, MetricType
 from pydantic import BaseModel
 
+
 class Telemetry(BaseModel):
     id: str
     vector: List[float] = FieldVector(dim=4, metric_type=MetricType.COSINE)
+
 
 async def main():
     async with AsyncWMilvus(Telemetry, uri="http://localhost:19530") as db:
         await db.insert(Telemetry(id="t1", vector=[0.5, 0.5, 0.0, 0.0]))
         results = await db.search_similar(vector=[0.5, 0.5, 0.1, 0.0], top_k=1)
         print(results[0].id)
+
 
 asyncio.run(main())
 ```
