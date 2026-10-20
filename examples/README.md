@@ -30,3 +30,4 @@ This directory contains standalone, production-ready examples demonstrating all 
 - `21_streaming_iter_all/`: Memory-efficient streaming iterators (`iter_all`) across large collections.
 - `22_partition_routing/`: Creating collection partitions, targeted partition ingestion, and partition-scoped search.
 - `23_batch_and_expr_deletion/`: High-performance batch ID deletion and conditional deletion via Milvus boolean expressions.
+- `24_scalar_models/`: Purely scalar / metadata models without vector fields operating alongside vector collections.
