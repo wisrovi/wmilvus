@@ -1121,3 +1121,39 @@ def test_multi_table_get_all_and_cross_collection_queries(
     # 5. Combined filter_by
     filtered = db.filter_by(limit=10)
     assert len(filtered) == 2
+
+
+@patch("wmilvus.core.client.MilvusClient")
+@patch("wmilvus.core.client.logger")
+def test_dimension_mismatch_warning_logged(
+    mock_logger: MagicMock,
+    mock_milvus_client: MagicMock,
+) -> None:
+    """Test warning logged when existing collection vector dimension differs from model definition.
+
+    This test validates:
+    1. When an existing Milvus collection has dim=4 but the Pydantic model declares dim=384,
+       a warning is logged explaining the mismatch and advising how to recreate the collection.
+    2. Initialization does not fail or crash, but alerts the developer.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.describe_collection.return_value = {
+        "collection_name": "videodto",
+        "fields": [
+            {"name": "id", "type": 21},
+            {"name": "summary_embedding", "type": 101, "params": {"dim": 4}},
+        ],
+    }
+    mock_milvus_client.return_value = mock_instance
+
+    class VideoDTO(BaseModel):
+        id: str
+        summary_embedding: list[float] = FieldVector(dim=384, default_factory=list)
+
+    config = {"uri": "http://localhost:19530"}
+    WMilvus(VideoDTO, config)
+
+    warning_calls = [str(call) for call in mock_logger.warning.call_args_list]
+    assert any("Dimension mismatch in Milvus collection" in msg for msg in warning_calls)
+    assert any("dim=4" in msg and "dim=384" in msg for msg in warning_calls)
