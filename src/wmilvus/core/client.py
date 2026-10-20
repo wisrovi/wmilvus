@@ -426,12 +426,25 @@ class CollectionRepository:
         else:
             try:
                 desc = self.client.describe_collection(collection_name=self.collection_name)
-                if isinstance(desc, dict) and hasattr(self.client, "add_collection_field"):
-                    existing_fields = {
-                        f.get("name")
-                        for f in desc.get("fields", [])
-                        if isinstance(f, dict) and f.get("name")
-                    }
+                if isinstance(desc, dict):
+                    vector_field_name = self.vector_meta["field_name"]
+                    expected_dim = int(self.vector_meta["dim"])
+                    for f in desc.get("fields", []):
+                        if isinstance(f, dict) and f.get("name") in (vector_field_name, "vector"):
+                            coll_dim = f.get("params", {}).get("dim") or f.get("dim")
+                            if coll_dim and int(coll_dim) != expected_dim:
+                                logger.warning(
+                                    f"Dimension mismatch in Milvus collection '{self.collection_name}': "
+                                    f"Existing collection has dim={coll_dim}, but model '{self.model_cls.__name__}' specifies dim={expected_dim}. "
+                                    f"Milvus vector dimensions are immutable. To use dim={expected_dim}, drop the collection (e.g. db.drop_collection({self.model_cls.__name__})) and recreate it."
+                                )
+
+                    if hasattr(self.client, "add_collection_field"):
+                        existing_fields = {
+                            f.get("name")
+                            for f in desc.get("fields", [])
+                            if isinstance(f, dict) and f.get("name")
+                        }
                     for f_info in scalar_fields:
                         f_name = f_info["field_name"]
                         if f_name not in existing_fields:
