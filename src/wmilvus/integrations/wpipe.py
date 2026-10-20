@@ -1,7 +1,9 @@
 """WMilvus integration step for WPipe pipeline execution."""
 
-from typing import Any, Dict, List, Optional, Type
+from typing import Any
+
 from pydantic import BaseModel
+
 from wmilvus.core.client import WMilvus
 
 
@@ -10,7 +12,7 @@ class WMilvusIngestStep:
 
     def __init__(
         self,
-        model_cls: Type[BaseModel],
+        model_cls: type[BaseModel],
         uri: str = "http://localhost:19530",
         batch_size: int = 1000,
     ) -> None:
@@ -18,7 +20,7 @@ class WMilvusIngestStep:
         self.uri = uri
         self.batch_size = batch_size
 
-    def process(self, records: List[BaseModel]) -> Dict[str, Any]:
+    def process(self, records: list[BaseModel]) -> dict[str, Any]:
         """Ingest records batch into Milvus DB collection.
 
         Args:
