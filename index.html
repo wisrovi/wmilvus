@@ -498,7 +498,7 @@
 <span class="kw">with</span> WMilvus(UserFace, uri=<span class="str">"http://localhost:19530"</span>) <span class="kw">as</span> db:
     user = UserFace(id=<span class="str">"u_001"</span>, name=<span class="str">"William Rodriguez"</span>, face_embedding=[<span class="num">0.1</span>] * <span class="num">128</span>)
     db.insert(user)
-    
+
     matches = db.search_similar(vector=[<span class="num">0.1</span>] * <span class="num">128</span>, top_k=<span class="num">5</span>)
     print(f<span class="str">"Top match: {matches[0].name}"</span>)</pre>
                 </div>
