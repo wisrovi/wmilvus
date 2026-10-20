@@ -1,9 +1,9 @@
 """Connection manager for Milvus connections."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Optional
+
 from loguru import logger
 from pymilvus import connections
-
 from wmilvus.exceptions import ConnectionError
 
 
@@ -37,7 +37,7 @@ class ConnectionManager:
     def connect(self) -> None:
         """Establish connection to Milvus."""
         try:
-            conn_params: Dict[str, Any] = {"alias": self.alias, "db_name": self.db_name}
+            conn_params: dict[str, Any] = {"alias": self.alias, "db_name": self.db_name}
             if self.uri:
                 conn_params["uri"] = self.uri
                 if self.token:
@@ -48,7 +48,7 @@ class ConnectionManager:
                 if self.user and self.password:
                     conn_params["user"] = self.user
                     conn_params["password"] = self.password
-            
+
             conn_params.update(self.extra_kwargs)
             connections.connect(**conn_params)
             self._connected = True
