@@ -4,7 +4,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from pydantic import BaseModel, Field
-from wmilvus import AsyncWMilvus, FieldVector, ForensicModel, WMilvus
+from wmilvus import AsyncWMilvus, FieldVector, ForensicModel, VectorSearchError, WMilvus
 
 
 class Person(BaseModel):
@@ -1157,3 +1157,102 @@ def test_dimension_mismatch_warning_logged(
     warning_calls = [str(call) for call in mock_logger.warning.call_args_list]
     assert any("Dimension mismatch in Milvus collection" in msg for msg in warning_calls)
     assert any("dim=4" in msg and "dim=384" in msg for msg in warning_calls)
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_scalar_only_model_without_vector_fields(mock_milvus_client: MagicMock) -> None:
+    """Test full ORM flow on a Pydantic model with no vector fields.
+
+    This test validates:
+    1. Models with no vector fields do not fail initialization.
+    2. A synthetic _dummy_vector field is generated for Milvus collection compatibility.
+    3. insert(), insert_batch(), and update() seamlessly supply the dummy vector payload.
+    4. get_by_field(), get_all(), filter_by(), and iter_all() return clean Pydantic model instances without dummy vector leakage.
+    5. Vector search operations on scalar models raise VectorSearchError.
+    6. verify_schema() succeeds and reports has_vector=False.
+    """
+    import pytest
+
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.describe_collection.return_value = {
+        "collection_name": "category",
+        "fields": [
+            {"name": "id", "type": 21},
+            {"name": "name", "type": 21},
+            {"name": "description", "type": 21},
+            {"name": "_dummy_vector", "type": 101, "params": {"dim": 8}},
+        ],
+    }
+    mock_instance.query.return_value = [
+        {
+            "id": "c1",
+            "name": "Electronics",
+            "description": "Tech gadgets",
+            "_dummy_vector": [0.0] * 8,
+        }
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    class Category(BaseModel):
+        id: str
+        name: str
+        description: str
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Category, config)
+    mock_instance.has_collection.return_value = True
+
+    # 1. Verify schema created with _dummy_vector
+    schema_calls = mock_instance.create_schema.call_args_list
+    assert len(schema_calls) >= 1
+
+    # 2. Insert record
+    cat = Category(id="c1", name="Electronics", description="Tech gadgets")
+    inserted = db.insert(cat)
+    assert inserted.id == "c1"
+    upsert_calls = mock_instance.upsert.call_args_list
+    assert len(upsert_calls) >= 1
+    last_payload = upsert_calls[-1].kwargs["data"][0]
+    assert "_dummy_vector" in last_payload
+    assert len(last_payload["_dummy_vector"]) == 8
+    assert last_payload["name"] == "Electronics"
+
+    # 3. Query record
+    found = db.get_by_field(id="c1")
+    assert found is not None
+    assert isinstance(found, Category)
+    assert found.name == "Electronics"
+    assert not hasattr(found, "_dummy_vector")
+
+    # 4. Query all records
+    all_cats = db.get_all()
+    assert len(all_cats) == 1
+    assert isinstance(all_cats[0], Category)
+
+    # 5. Filter records
+    filtered = db.filter_by(name="Electronics")
+    assert len(filtered) == 1
+
+    # 6. Update record
+    found.name = "Consumer Tech"
+    db.update("c1", found)
+    update_payload = mock_instance.upsert.call_args_list[-1].kwargs["data"][0]
+    assert update_payload["name"] == "Consumer Tech"
+    assert "_dummy_vector" in update_payload
+
+    # 7. Search operations raise VectorSearchError
+    with pytest.raises(VectorSearchError) as exc_info:
+        db.search_similar([0.0] * 8)
+    assert "scalar-only models" in str(exc_info.value)
+
+    with pytest.raises(VectorSearchError):
+        db.search_range([0.0] * 8)
+
+    with pytest.raises(VectorSearchError):
+        db.search_hybrid([0.0] * 8)
+
+    # 8. verify_schema
+    schema_status = db[Category].verify_schema()
+    assert schema_status["status"] == "VALID"
+    assert schema_status["has_vector"] is False
