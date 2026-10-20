@@ -51,20 +51,202 @@ def inspect_model_vector_field(model_cls: type[BaseModel]) -> dict[str, Any]:
 def inspect_model_pk_field(model_cls: type[BaseModel]) -> dict[str, Any]:
     """Inspect model to identify primary key field name, whether it is integer, and auto_id preference."""
     fields = model_cls.model_fields
-    if "id" in fields:
-        field_info = fields["id"]
-        annotation = field_info.annotation
-        import typing
+    for candidate in ("id", "id_"):
+        if candidate in fields:
+            field_info = fields[candidate]
+            annotation = field_info.annotation
+            import typing
 
-        origin = typing.get_origin(annotation)
-        args = typing.get_args(annotation)
-        is_int = annotation is int or (origin is typing.Union and int in args)
-        return {
-            "name": "id",
-            "is_int": is_int,
-            "auto_id": is_int or field_info.default is None,
-        }
+            origin = typing.get_origin(annotation)
+            args = typing.get_args(annotation)
+            is_int = annotation is int or (origin is typing.Union and int in args)
+            return {
+                "name": candidate,
+                "is_int": is_int,
+                "auto_id": is_int or field_info.default is None,
+            }
     return {"name": "id", "is_int": False, "auto_id": False}
+
+
+def inspect_model_fields_schema(
+    model_cls: type[BaseModel], pk_name: str, vector_field_name: str
+) -> list[dict[str, Any]]:
+    """Inspect Pydantic model fields to generate explicit Milvus collection schema definitions.
+
+    Translates Pydantic types into appropriate Milvus DataType entries (VARCHAR, INT64,
+    DOUBLE, BOOL, ARRAY, JSON) so that every field has its own dedicated column in Milvus,
+    preventing fields from being collapsed into dynamic fields ($meta).
+    """
+    import typing
+    from datetime import date, datetime
+
+    schema_fields: list[dict[str, Any]] = []
+
+    for field_name, field_info in model_cls.model_fields.items():
+        if field_name in (pk_name, vector_field_name):
+            continue
+
+        annotation = field_info.annotation
+
+        # Unwrap Optional / Union[..., None]
+        origin = typing.get_origin(annotation)
+        if origin is typing.Union:
+            args = [arg for arg in typing.get_args(annotation) if arg is not type(None)]
+            if len(args) == 1:
+                annotation = args[0]
+                origin = typing.get_origin(annotation)
+
+        # 1. Strings
+        if annotation is str:
+            max_len = 65535
+            if field_info.metadata:
+                for meta in field_info.metadata:
+                    if hasattr(meta, "max_length") and meta.max_length:
+                        max_len = min(int(meta.max_length), 65535)
+                        break
+            schema_fields.append(
+                {
+                    "field_name": field_name,
+                    "datatype": DataType.VARCHAR,
+                    "max_length": max_len,
+                    "nullable": True,
+                }
+            )
+
+        # 2. Integers
+        elif annotation is int:
+            schema_fields.append(
+                {
+                    "field_name": field_name,
+                    "datatype": DataType.INT64,
+                    "nullable": True,
+                }
+            )
+
+        # 3. Floats
+        elif annotation is float:
+            schema_fields.append(
+                {
+                    "field_name": field_name,
+                    "datatype": DataType.DOUBLE,
+                    "nullable": True,
+                }
+            )
+
+        # 4. Booleans
+        elif annotation is bool:
+            schema_fields.append(
+                {
+                    "field_name": field_name,
+                    "datatype": DataType.BOOL,
+                    "nullable": True,
+                }
+            )
+
+        # 5. Dates and datetimes (serialized as ISO strings in json mode)
+        elif annotation in (datetime, date):
+            schema_fields.append(
+                {
+                    "field_name": field_name,
+                    "datatype": DataType.VARCHAR,
+                    "max_length": 64,
+                    "nullable": True,
+                }
+            )
+
+        # 6. Dictionaries / Mappings -> DataType.JSON
+        elif origin in (dict, typing.Mapping, dict) or annotation is dict:
+            schema_fields.append(
+                {
+                    "field_name": field_name,
+                    "datatype": DataType.JSON,
+                    "nullable": True,
+                }
+            )
+
+        # 7. Lists / Sequences
+        elif origin in (list, typing.Sequence, list) or annotation is list:
+            item_args = typing.get_args(annotation)
+            item_type = item_args[0] if item_args else None
+            if item_type and typing.get_origin(item_type) is typing.Union:
+                union_args = [a for a in typing.get_args(item_type) if a is not type(None)]
+                if len(union_args) == 1:
+                    item_type = union_args[0]
+
+            if item_type is str:
+                schema_fields.append(
+                    {
+                        "field_name": field_name,
+                        "datatype": DataType.ARRAY,
+                        "element_type": DataType.VARCHAR,
+                        "max_capacity": 4096,
+                        "max_length": 512,
+                        "nullable": True,
+                    }
+                )
+            elif item_type is int:
+                schema_fields.append(
+                    {
+                        "field_name": field_name,
+                        "datatype": DataType.ARRAY,
+                        "element_type": DataType.INT64,
+                        "max_capacity": 4096,
+                        "nullable": True,
+                    }
+                )
+            elif item_type is float:
+                schema_fields.append(
+                    {
+                        "field_name": field_name,
+                        "datatype": DataType.ARRAY,
+                        "element_type": DataType.DOUBLE,
+                        "max_capacity": 4096,
+                        "nullable": True,
+                    }
+                )
+            elif item_type is bool:
+                schema_fields.append(
+                    {
+                        "field_name": field_name,
+                        "datatype": DataType.ARRAY,
+                        "element_type": DataType.BOOL,
+                        "max_capacity": 4096,
+                        "nullable": True,
+                    }
+                )
+            else:
+                schema_fields.append(
+                    {
+                        "field_name": field_name,
+                        "datatype": DataType.JSON,
+                        "nullable": True,
+                    }
+                )
+
+        # 8. Arbitrary JSON or sub-models
+        elif annotation is typing.Any or (
+            isinstance(annotation, type) and issubclass(annotation, BaseModel)
+        ):
+            schema_fields.append(
+                {
+                    "field_name": field_name,
+                    "datatype": DataType.JSON,
+                    "nullable": True,
+                }
+            )
+
+        # 9. Fallback string
+        else:
+            schema_fields.append(
+                {
+                    "field_name": field_name,
+                    "datatype": DataType.VARCHAR,
+                    "max_length": 65535,
+                    "nullable": True,
+                }
+            )
+
+    return schema_fields
 
 
 def build_filter_expr(filter_kwargs: dict[str, Any]) -> str:
@@ -96,6 +278,12 @@ def build_filter_expr(filter_kwargs: dict[str, Any]) -> str:
             clause = f"{field_name} <= {val}"
         elif op == "like":
             clause = f'{field_name} like "{val}"'
+        elif op == "contains":
+            clause = (
+                f'array_contains({field_name}, "{val}")'
+                if isinstance(val, str)
+                else f"array_contains({field_name}, {val})"
+            )
         elif op == "in" and isinstance(val, (list, tuple, set)):
             formatted_vals = [f'"{v}"' if isinstance(v, str) else str(v) for v in val]
             clause = f"{field_name} in [{', '.join(formatted_vals)}]"
@@ -160,17 +348,22 @@ class CollectionRepository:
         self.model_cls = model_cls
         self.collection_name = get_model_tablename(model_cls)
         self.vector_meta = inspect_model_vector_field(model_cls)
+        self.pk_info = inspect_model_pk_field(model_cls)
         self.forensic = forensic or issubclass(model_cls, ForensicModel)
         self.consistency_level = consistency_level
         self._ensure_collection()
 
     def _ensure_collection(self) -> None:
-        if not self.client.has_collection(collection_name=self.collection_name):
-            pk_info = inspect_model_pk_field(self.model_cls)
-            id_type = DataType.INT64 if pk_info["is_int"] else DataType.VARCHAR
-            auto_id = pk_info["auto_id"]
-            vector_field_name = self.vector_meta["field_name"]
+        pk_info = self.pk_info
+        pk_name = pk_info["name"]
+        id_type = DataType.INT64 if pk_info["is_int"] else DataType.VARCHAR
+        auto_id = pk_info["auto_id"]
+        vector_field_name = self.vector_meta["field_name"]
+        scalar_fields = inspect_model_fields_schema(
+            self.model_cls, pk_name=pk_name, vector_field_name=vector_field_name
+        )
 
+        if not self.client.has_collection(collection_name=self.collection_name):
             try:
                 schema = self.client.create_schema(
                     auto_id=auto_id,
@@ -178,14 +371,17 @@ class CollectionRepository:
                 )
                 if pk_info["is_int"]:
                     schema.add_field(
-                        field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=auto_id
+                        field_name=pk_name,
+                        datatype=DataType.INT64,
+                        is_primary=True,
+                        auto_id=auto_id,
                     )
                 else:
                     schema.add_field(
-                        field_name="id",
+                        field_name=pk_name,
                         datatype=DataType.VARCHAR,
                         is_primary=True,
-                        max_length=64,
+                        max_length=512,
                         auto_id=auto_id,
                     )
 
@@ -194,6 +390,9 @@ class CollectionRepository:
                     datatype=DataType.FLOAT_VECTOR,
                     dim=self.vector_meta["dim"],
                 )
+
+                for f_info in scalar_fields:
+                    schema.add_field(**f_info)
 
                 index_params = self.client.prepare_index_params()
                 index_params.add_index(
@@ -219,12 +418,47 @@ class CollectionRepository:
                     metric_type=self.vector_meta["metric_type"],
                     auto_id=auto_id,
                     id_type=id_type,
-                    max_length=64,
+                    max_length=512,
                 )
                 logger.info(
                     f"Created collection '{self.collection_name}' for model {self.model_cls.__name__}"
                 )
         else:
+            try:
+                desc = self.client.describe_collection(collection_name=self.collection_name)
+                if isinstance(desc, dict) and hasattr(self.client, "add_collection_field"):
+                    existing_fields = {
+                        f.get("name")
+                        for f in desc.get("fields", [])
+                        if isinstance(f, dict) and f.get("name")
+                    }
+                    for f_info in scalar_fields:
+                        f_name = f_info["field_name"]
+                        if f_name not in existing_fields:
+                            try:
+                                field_kwargs = {
+                                    k: v
+                                    for k, v in f_info.items()
+                                    if k not in ("field_name", "datatype")
+                                }
+                                self.client.add_collection_field(
+                                    collection_name=self.collection_name,
+                                    field_name=f_name,
+                                    data_type=f_info["datatype"],
+                                    **field_kwargs,
+                                )
+                                logger.info(
+                                    f"Added missing column '{f_name}' to existing collection '{self.collection_name}'"
+                                )
+                            except Exception as add_err:
+                                logger.debug(
+                                    f"Could not auto-add missing column '{f_name}' to '{self.collection_name}': {add_err}"
+                                )
+            except Exception as schema_err:
+                logger.debug(
+                    f"Could not inspect/update existing schema for '{self.collection_name}': {schema_err}"
+                )
+
             try:
                 load_state = self.client.get_load_state(collection_name=self.collection_name)
                 if isinstance(load_state, dict):
@@ -246,19 +480,21 @@ class CollectionRepository:
         """Insert a single typed Pydantic model instance into Milvus with forensic audit logging."""
         data_dict = record.model_dump(mode="json")
         vector_field_name = self.vector_meta["field_name"]
+        pk_name = self.pk_info["name"]
+
         if self.forensic and user_id is not None:
             data_dict["create_by"] = user_id
             data_dict["create_in"] = datetime.now(timezone.utc).isoformat()
 
-        rec_id = data_dict.get("id")
+        rec_id = data_dict.get(pk_name)
         has_id = rec_id is not None and rec_id != ""
 
         payload = {
             vector_field_name: data_dict[vector_field_name],
-            **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
+            **{k: v for k, v in data_dict.items() if k not in (pk_name, vector_field_name)},
         }
         if has_id:
-            payload["id"] = rec_id
+            payload[pk_name] = rec_id
 
         kwargs: dict[str, Any] = {}
         if partition_name:
@@ -272,8 +508,8 @@ class CollectionRepository:
             )
             if isinstance(insert_res, dict) and insert_res.get("ids"):
                 generated_id = insert_res["ids"][0]
-                if hasattr(record, "id"):
-                    record.id = generated_id
+                if hasattr(record, pk_name):
+                    setattr(record, pk_name, generated_id)
                 rec_id = generated_id
 
         with contextlib.suppress(Exception):
@@ -302,6 +538,7 @@ class CollectionRepository:
             return {"inserted_count": 0, "batches_processed": 0}
 
         vector_field_name = self.vector_meta["field_name"]
+        pk_name = self.pk_info["name"]
         total_records = len(records)
         batches_processed = 0
 
@@ -319,17 +556,17 @@ class CollectionRepository:
                 if self.forensic and user_id is not None:
                     data_dict["create_by"] = user_id
                     data_dict["create_in"] = datetime.now(timezone.utc).isoformat()
-                rec_id = data_dict.get("id")
+                rec_id = data_dict.get(pk_name)
                 rec_has_id = rec_id is not None and rec_id != ""
                 if not rec_has_id:
                     has_ids = False
 
                 payload = {
                     vector_field_name: data_dict[vector_field_name],
-                    **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
+                    **{k: v for k, v in data_dict.items() if k not in (pk_name, vector_field_name)},
                 }
                 if rec_has_id:
-                    payload["id"] = rec_id
+                    payload[pk_name] = rec_id
                 payload_batch.append(payload)
 
             if has_ids:
@@ -342,8 +579,8 @@ class CollectionRepository:
                 )
                 if isinstance(res, dict) and res.get("ids"):
                     for rec, gid in zip(chunk, res["ids"]):
-                        if hasattr(rec, "id"):
-                            rec.id = gid
+                        if hasattr(rec, pk_name):
+                            setattr(rec, pk_name, gid)
 
             batches_processed += 1
             logger.info(
@@ -414,12 +651,7 @@ class CollectionRepository:
         """Fetch a single record matching scalar field kwargs."""
         if not kwargs:
             return None
-        field_name, field_value = next(iter(kwargs.items()))
-        filter_expr = (
-            f'{field_name} == "{field_value}"'
-            if isinstance(field_value, str)
-            else f"{field_name} == {field_value}"
-        )
+        filter_expr = build_filter_expr(kwargs)
         extra_kwargs: dict[str, Any] = {}
         if partition_names:
             extra_kwargs["partition_names"] = partition_names
@@ -621,7 +853,7 @@ class CollectionRepository:
             for item in search_output[0]:
                 entity = item.get("entity", {})
                 distance = float(item.get("distance", 0.0))
-                rec_id = str(item.get("id", entity.get("id", "")))
+                rec_id = str(item.get("id", entity.get(self.pk_info["name"], entity.get("id", ""))))
                 metadata = {
                     k: v for k, v in entity.items() if k not in ("vector", vector_field_name)
                 }
@@ -749,8 +981,10 @@ class CollectionRepository:
         partition_name: Optional[str] = None,
     ) -> BaseModel:
         """Update existing record in Milvus collection with forensic audit logging."""
+        pk_name = self.pk_info["name"]
         before_item = self.get_by_field(
-            id=record_id, partition_names=[partition_name] if partition_name else None
+            partition_names=[partition_name] if partition_name else None,
+            **{pk_name: record_id},
         )
         data_before = before_item.model_dump(mode="json") if before_item else None
 
@@ -776,9 +1010,9 @@ class CollectionRepository:
             data_dict["update_by"] = user_id
             data_dict["update_in"] = datetime.now(timezone.utc).isoformat()
         payload = {
-            "id": record_id,
+            pk_name: record_id,
             vector_field_name: data_dict[vector_field_name],
-            **{k: v for k, v in data_dict.items() if k not in ("id", vector_field_name)},
+            **{k: v for k, v in data_dict.items() if k not in (pk_name, vector_field_name)},
         }
         kwargs: dict[str, Any] = {}
         if partition_name:
@@ -812,8 +1046,10 @@ class CollectionRepository:
         partition_name: Optional[str] = None,
     ) -> None:
         """Delete record by ID from Milvus collection with forensic audit logging."""
+        pk_name = self.pk_info["name"]
         before_item = self.get_by_field(
-            id=record_id, partition_names=[partition_name] if partition_name else None
+            partition_names=[partition_name] if partition_name else None,
+            **{pk_name: record_id},
         )
         data_before = before_item.model_dump(mode="json") if before_item else None
         vector_field_name = self.vector_meta["field_name"]
@@ -835,6 +1071,12 @@ class CollectionRepository:
                 else None,
                 user_id=user_id,
             )
+
+    def drop(self) -> None:
+        """Drop this collection completely from the Milvus database."""
+        if self.client.has_collection(collection_name=self.collection_name):
+            self.client.drop_collection(collection_name=self.collection_name)
+            logger.info(f"Dropped collection '{self.collection_name}' from Milvus")
 
     def delete_batch(
         self,
@@ -1271,6 +1513,24 @@ class WMilvus:
         )
         return raw_items
 
+    def drop_collection(self, model_cls_or_name: Union[type[BaseModel], str]) -> None:
+        """Drop a collection completely from Milvus by model class or collection name."""
+        if isinstance(model_cls_or_name, str):
+            col_name = model_cls_or_name
+        else:
+            col_name = get_model_tablename(model_cls_or_name)
+
+        if self.client.has_collection(collection_name=col_name):
+            self.client.drop_collection(collection_name=col_name)
+            logger.info(f"Dropped collection '{col_name}' from Milvus")
+
+        for key in list(self.repositories.keys()):
+            if (
+                key == model_cls_or_name
+                or getattr(key, "__name__", "").lower() == str(col_name).lower()
+            ):
+                del self.repositories[key]
+
     def close(self) -> None:
         if hasattr(self.client, "close"):
             try:
@@ -1520,6 +1780,10 @@ class AsyncCollectionRepository:
             user_id=user_id,
             partition_name=partition_name,
         )
+
+    async def drop(self) -> None:
+        """Drop this collection completely from the Milvus database asynchronously."""
+        return await asyncio.to_thread(self._repo.drop)
 
 
 class AsyncWMilvus:
@@ -1821,6 +2085,10 @@ class AsyncWMilvus:
         raise CollectionError(
             "delete_by_expr() on main AsyncWMilvus instance requires specifying repository in multi-collection mode"
         )
+
+    async def drop_collection(self, model_cls_or_name: Union[type[BaseModel], str]) -> None:
+        """Drop a collection completely from Milvus by model class or collection name asynchronously."""
+        return await asyncio.to_thread(self._sync_client.drop_collection, model_cls_or_name)
 
     async def get_ghost_audit_log(self, limit: int = 100) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._sync_client.get_ghost_audit_log, limit=limit)
