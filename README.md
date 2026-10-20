@@ -31,6 +31,7 @@
 - **Bulk Vector Ingestion** — High-performance chunked bulk insertion (`insert_batch`) with automatic payload chunking and ID propagation.
 - **Async Client Support (`AsyncWMilvus`)** — Full non-blocking async mirror with `async with` context manager for FastAPI and asyncio applications.
 - **Schema Verification & Dimension Mismatch Detection** — Verification of Pydantic model vector dimensions against active Milvus collection schemas with explicit warning logging when existing server collections deviate from declared dimensions.
+- **Optional Vector Fields & Scalar-Only Collections** — Collections do not strictly require vector fields. Pure scalar or metadata models (e.g., users, categories, configurations, relational entities) can be defined without any vector fields. WMilvus transparently satisfies Milvus's internal vector requirement under the hood with lightweight synthetic dummy vectors, enabling full type-safe CRUD, filtering, streaming, and multi-table querying without imposing vectors on your models.
 - **Single & Multi-Collection ORM Routing** — Automatic collection creation and full multi-table query support: call `db.get_all()` across all registered collections simultaneously, scope queries by model class (`db.get_all(Model)` or `db[Model].get_all()`), or access repositories directly by attribute (`db.modelname`).
 - **Enterprise Ghost Audit Log (`_forensic_audit_log`)** — Global audit trail tracking `INSERT`, `UPDATE`, `SOFT_DELETE`, and `HARD_DELETE` operations for models inheriting from `ForensicModel` with safe JSON ISO-8601 datetime serialization.
 - **Automated Collection Memory Loading** — Transparent auto-loading (`load_collection`) into memory for pre-existing or offline Milvus collections upon connection.
@@ -50,6 +51,7 @@
 | Numerical Core | NumPy |
 | Logging | Loguru |
 | CLI Framework | Click |
+| Packaging & Build | setuptools>=61.0, wheel |
 | Testing Framework | pytest, pytest-cov |
 
 ## Quick Start
@@ -124,6 +126,7 @@ The repository includes organized example scripts in `examples/`:
 - [`examples/21_streaming_iter_all/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/21_streaming_iter_all/example.py) — Memory-efficient streaming iterators (`iter_all`) across large collections.
 - [`examples/22_partition_routing/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/22_partition_routing/example.py) — Creating collection partitions, targeted partition ingestion, and partition-scoped search.
 - [`examples/23_batch_and_expr_deletion/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/23_batch_and_expr_deletion/example.py) — High-performance batch ID deletion and conditional deletion via Milvus boolean expressions.
+- [`examples/24_scalar_models/example.py`](file:///home/william.rodriguez/Documents/w_libraries/w_libraries/wmilvus_os/wmilvus/examples/24_scalar_models/example.py) — Purely scalar / metadata models without vector fields operating alongside vector collections.
 
 ## Running Tests
 
