@@ -16,7 +16,8 @@
 
 ## Key Features
 
-- **Pydantic Model Declarations** — Define collections as standard Pydantic models with vector annotations (`FieldVector`, `MetricType`, `IndexType`).
+- **Pydantic Model Declarations** — Define collections as standard Pydantic models with vector annotations (`FieldVector`, `MetricType`, `IndexType`). `FieldVector` automatically defaults to `default_factory=list` to prevent missing field validation errors during deserialization.
+- **Automatic Vector Retrieval & Preservation** — Query methods (`get_by_field`, `filter_by`) automatically include vector fields by default (`include_vector=True`). Calling `update()` with an empty vector automatically preserves the pre-existing vector from Milvus, eliminating dimension mismatch crashes on partial or metadata-only updates.
 - **Dynamic Vector Fields & Auto-ID** — Native payload generation supporting custom vector attribute names (`embedding`, `face_vec`, etc.) and automated `INT64` primary key generation without requiring manual IDs.
 - **Universal Primary Key Support** — Full compatibility with both auto-increment integer (`INT64`) and string (`VARCHAR`) primary keys across all CRUD, filtering, and search routines.
 - **Collection Partitioning & Multi-Tenancy** — Route insertions, queries, and searches to specific Milvus partitions (`partition_name` / `partition_names`).
