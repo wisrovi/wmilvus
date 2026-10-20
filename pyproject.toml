@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wmilvus"
-version = "0.4.1"
+version = "0.4.2"
 authors = [
     { name = "WILLIAM R.", email = "wisrovi.rodriguez@gmail.com" },
 ]
@@ -59,7 +59,7 @@ exclude = ["examples/", "docs/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
-ignore = ["E501"]
+ignore = ["E501", "N802"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
