@@ -2,13 +2,13 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 from pydantic import BaseModel, Field
 
 
-def normalize_vector(vec: Union[List[float], np.ndarray]) -> List[float]:
+def normalize_vector(vec: Union[list[float], np.ndarray]) -> list[float]:
     """Normalize a dense vector embedding to unit length (L2 norm = 1.0).
 
     Args:
@@ -52,7 +52,7 @@ def FieldVector(
     dim: int = 128,
     metric_type: Union[str, MetricType] = MetricType.COSINE,
     index_type: Union[str, IndexType] = IndexType.HNSW,
-    params: Optional[Dict[str, Any]] = None,
+    params: Optional[dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Any:
     """Helper field metadata annotation for vector embedding attributes in Pydantic models.
@@ -62,6 +62,8 @@ def FieldVector(
         metric_type: Similarity metric type (MetricType.COSINE, MetricType.L2, MetricType.IP, etc.).
         index_type: Index algorithm (IndexType.HNSW, IndexType.IVF_FLAT, IndexType.FLAT, etc.).
         params: Additional index building parameters.
+        **kwargs: Additional Pydantic Field keyword arguments. Defaults to
+            `default_factory=list` if neither `default` nor `default_factory` is provided.
 
     Returns:
         Pydantic Field instance with vector metadata attached.
@@ -83,6 +85,9 @@ def FieldVector(
         }
     )
 
+    if "default" not in kwargs and "default_factory" not in kwargs:
+        kwargs["default_factory"] = list
+
     return Field(json_schema_extra=json_schema_extra, **kwargs)
 
 
@@ -90,8 +95,8 @@ class VectorRecord(BaseModel):
     """Data transfer object representing a vector entity for indexing."""
 
     id: str = Field(description="Unique identifier for the vector record")
-    vector: List[float] = Field(description="Dense vector embedding representation")
-    metadata: Dict[str, Any] = Field(
+    vector: list[float] = Field(description="Dense vector embedding representation")
+    metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Arbitrary key-value metadata associated with the record",
     )
@@ -102,7 +107,7 @@ class SearchMatch(BaseModel):
 
     id: str = Field(description="Identifier of the matched entity")
     distance: float = Field(description="Similarity distance score")
-    metadata: Dict[str, Any] = Field(
+    metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Retrieved entity metadata and attributes",
     )
