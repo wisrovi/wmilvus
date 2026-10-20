@@ -1049,3 +1049,75 @@ def test_drop_collection_operations(
     db.drop_collection(Person)
     mock_instance.drop_collection.assert_called_with(collection_name="person")
     assert Person not in db.repositories
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_multi_table_get_all_and_cross_collection_queries(
+    mock_milvus_client: MagicMock,
+) -> None:
+    """Test multi-table get_all() combined and scoped querying across multiple models.
+
+    This test validates:
+    1. Initializing WMilvus with a list of models [UserFace, ProductImage] enables multi-table mode.
+    2. Calling db.get_all() with no arguments queries all registered collections and returns a combined list of Pydantic models.
+    3. Calling db.get_all(UserFace) or db.get_all("users_face") routes specifically to that collection.
+    4. Calling db.filter_by() across collections queries all repositories and aggregates matches.
+    5. Calling db.get_by_field() searches repositories and returns the first matching item.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+
+    def mock_query(collection_name: str, filter: str = "", **kwargs: Any) -> list[dict[str, Any]]:
+        if "user" in collection_name.lower():
+            return [
+                {
+                    "id": "u1",
+                    "name": "William Rodriguez",
+                    "face_vec": [0.1] * 128,
+                }
+            ]
+        elif "product" in collection_name.lower():
+            return [
+                {
+                    "id": "p101",
+                    "title": "Camera Drone",
+                    "price": 499.0,
+                    "image_vec": [0.5] * 64,
+                }
+            ]
+        return []
+
+    mock_instance.query.side_effect = mock_query
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus([UserFace, ProductImage], config)
+
+    # 1. Combined get_all() across all collections
+    all_records = db.get_all()
+    assert len(all_records) == 2
+    types = {type(r) for r in all_records}
+    assert UserFace in types
+    assert ProductImage in types
+
+    # 2. Scoped get_all(UserFace) by model class
+    users = db.get_all(UserFace)
+    assert len(users) == 1
+    assert isinstance(users[0], UserFace)
+    assert users[0].id == "u1"
+
+    # 3. Scoped get_all("productimage") by collection name
+    products = db.get_all("productimage")
+    assert len(products) == 1
+    assert isinstance(products[0], ProductImage)
+    assert products[0].id == "p101"
+
+    # 4. Scoped get_by_field
+    user = db.get_by_field(UserFace, id="u1")
+    assert user is not None
+    assert user.id == "u1"
+    assert isinstance(user, UserFace)
+
+    # 5. Combined filter_by
+    filtered = db.filter_by(limit=10)
+    assert len(filtered) == 2
