@@ -675,3 +675,183 @@ def test_forensic_datetime_serialization_and_autoload_and_flexible_init(
     matches = db.search_similar_with_scores(vector=[0.1] * 128, top_k=1)
     assert len(matches) == 1
     assert "face_vec" not in matches[0].metadata
+
+
+def test_field_vector_default_factory() -> None:
+    """Test FieldVector automatically sets default_factory=list to prevent Pydantic ValidationError.
+
+    This test validates:
+    1. A Pydantic model with FieldVector(dim=384) can be instantiated without explicitly
+       passing the vector field, automatically assigning an empty list [].
+    2. model_validate() parses a dictionary containing only scalar fields without raising
+       ValidationError('summary_embedding: Field required').
+    3. Explicit vector assignments are preserved as expected.
+    4. Custom default values or custom default_factories supplied by the caller are honored.
+    """
+
+    class Article(BaseModel):
+        id: str
+        title: str
+        embedding: list[float] = FieldVector(dim=384)
+
+    class CustomArticle(BaseModel):
+        id: str
+        embedding: list[float] = FieldVector(dim=4, default_factory=lambda: [0.0] * 4)
+
+    # 1. Instantiation without vector defaults to empty list []
+    art1 = Article(id="art_1", title="Vector Databases")
+    assert art1.embedding == []
+
+    # 2. Deserialization from dictionary with only scalar fields succeeds
+    raw_dict = {"id": "art_2", "title": "Milvus Client"}
+    art2 = Article.model_validate(raw_dict)
+    assert art2.id == "art_2"
+    assert art2.embedding == []
+
+    # 3. Explicit vector assignment is preserved
+    vec = [0.1] * 384
+    art3 = Article(id="art_3", title="Semantic Search", embedding=vec)
+    assert art3.embedding == vec
+
+    # 4. Custom default_factory is honored
+    custom_art = CustomArticle(id="art_4")
+    assert custom_art.embedding == [0.0, 0.0, 0.0, 0.0]
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_get_by_field_include_vector_and_custom_output_fields(
+    mock_milvus_client: MagicMock,
+) -> None:
+    """Test get_by_field includes vector field in output_fields by default and supports custom overrides.
+
+    This test validates:
+    1. By default (include_vector=True), get_by_field includes ['*', 'embedding'] in output_fields
+       so Milvus returns vector embeddings rather than omitting them.
+    2. Returned vector embeddings are parsed into the typed Pydantic model instance.
+    3. Explicit include_vector=False restricts output_fields to ['*'].
+    4. Explicit output_fields parameter completely overrides automatic field selection.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.query.return_value = [
+        {
+            "id": "p100",
+            "name": "Alice Developer",
+            "age": 28,
+            "is_active": True,
+            "embedding": [0.2, 0.4, 0.6, 0.8],
+        }
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    # 1. Default call: include_vector=True -> output_fields=['*', 'embedding']
+    result = db.get_by_field(id="p100")
+    assert result is not None
+    assert result.name == "Alice Developer"
+    assert result.embedding == [0.2, 0.4, 0.6, 0.8]
+
+    first_call_kwargs = mock_instance.query.call_args.kwargs
+    assert first_call_kwargs["output_fields"] == ["*", "embedding"]
+
+    # 2. Explicit include_vector=False -> output_fields=['*']
+    db.get_by_field(id="p100", include_vector=False)
+    second_call_kwargs = mock_instance.query.call_args.kwargs
+    assert second_call_kwargs["output_fields"] == ["*"]
+
+    # 3. Explicit custom output_fields override
+    db.get_by_field(id="p100", output_fields=["id", "name"])
+    third_call_kwargs = mock_instance.query.call_args.kwargs
+    assert third_call_kwargs["output_fields"] == ["id", "name"]
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_filter_by_include_vector(mock_milvus_client: MagicMock) -> None:
+    """Test filter_by includes vector field in output_fields when include_vector is True.
+
+    This test validates:
+    1. filter_by passes ['*', 'embedding'] in output_fields by default.
+    2. filter_by passes ['*'] when include_vector=False is provided.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.query.return_value = [
+        {
+            "id": "p200",
+            "name": "Bob Admin",
+            "age": 35,
+            "is_active": True,
+            "embedding": [0.1, 0.3, 0.5, 0.7],
+        }
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    # 1. Default call: include_vector=True
+    res = db.filter_by(age__gte=30, limit=5)
+    assert len(res) == 1
+    assert res[0].embedding == [0.1, 0.3, 0.5, 0.7]
+    assert mock_instance.query.call_args.kwargs["output_fields"] == ["*", "embedding"]
+
+    # 2. Explicit include_vector=False
+    db.filter_by(age__gte=30, limit=5, include_vector=False)
+    assert mock_instance.query.call_args.kwargs["output_fields"] == ["*"]
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_update_preserves_existing_vector_when_incoming_vector_empty(
+    mock_milvus_client: MagicMock,
+) -> None:
+    """Test update() preserves existing vector when incoming model has an empty vector.
+
+    This test validates:
+    1. When an entity is updated using a Pydantic model whose vector field is empty (e.g. []),
+       update() looks up the existing record in Milvus.
+    2. The existing non-empty vector is preserved in the upsert payload sent to MilvusClient,
+       preventing Milvus dimension mismatch exceptions (length 0 vs schema dimension).
+    3. The vector attribute on the returned record is also populated with the preserved vector.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    # Existing record in Milvus has a valid 4-dimensional vector
+    mock_instance.query.return_value = [
+        {
+            "id": "1",
+            "name": "Juan Pérez",
+            "age": 30,
+            "is_active": True,
+            "embedding": [0.1, 0.2, 0.3, 0.4],
+        }
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    config = {"uri": "http://localhost:19530"}
+    db = WMilvus(Person, config)
+
+    # Incoming update record with modified age and EMPTY vector []
+    partial_update_record = Person(
+        id="1",
+        name="Juan Pérez",
+        age=31,
+        is_active=True,
+        embedding=[],  # Empty vector from scalar update
+    )
+
+    updated_result = db.update("1", partial_update_record)
+
+    # Check that update() fetched the existing record
+    mock_instance.query.assert_called()
+
+    # Check that upsert payload received the PRESERVED vector, NOT an empty list
+    upsert_kwargs = mock_instance.upsert.call_args.kwargs
+    payload = upsert_kwargs["data"][0]
+    assert payload["embedding"] == [0.1, 0.2, 0.3, 0.4]
+    assert payload["age"] == 31
+
+    # Check that returned record object has the preserved vector restored
+    assert updated_result.embedding == [0.1, 0.2, 0.3, 0.4]
+    assert updated_result.age == 31
