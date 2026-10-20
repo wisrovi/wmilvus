@@ -1,6 +1,7 @@
 """Backup and restore utilities for WMilvus using WSQLite ORM."""
 
-from typing import Any, Dict, Type
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from wmilvus.core.client import WMilvus
@@ -10,15 +11,17 @@ class WMilvusBackupRecord(BaseModel):
     """Pydantic model representing a backed-up vector record for WSQLite storage."""
 
     id: str = Field(description="Unique record identifier")
-    payload_json: str = Field(description="Serialized JSON representation of the Pydantic model record")
+    payload_json: str = Field(
+        description="Serialized JSON representation of the Pydantic model record"
+    )
 
 
 def export_to_sqlite(
     db: WMilvus,
-    model_cls: Type[BaseModel],
+    model_cls: type[BaseModel],
     sqlite_path: str,
     limit: int = 10000,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Export all records from a WMilvus collection into a local SQLite database file via WSQLite ORM.
 
     Args:
@@ -53,10 +56,10 @@ def export_to_sqlite(
 
 def import_from_sqlite(
     db: WMilvus,
-    model_cls: Type[BaseModel],
+    model_cls: type[BaseModel],
     sqlite_path: str,
     batch_size: int = 500,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Import records from a WSQLite database file back into a WMilvus collection via WSQLite ORM.
 
     Args:
