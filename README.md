@@ -30,7 +30,7 @@
 - **Multi-Vector & Hybrid Search Rankers** — Dense + scalar hybrid search with direct support for Milvus rerankers (`RRFRanker`, `WeightedRanker`).
 - **Bulk Vector Ingestion** — High-performance chunked bulk insertion (`insert_batch`) with automatic payload chunking and ID propagation.
 - **Async Client Support (`AsyncWMilvus`)** — Full non-blocking async mirror with `async with` context manager for FastAPI and asyncio applications.
-- **Schema Verification (`verify_schema`)** — Verification of Pydantic model vector dimensions against active Milvus collection schemas.
+- **Schema Verification & Dimension Mismatch Detection** — Verification of Pydantic model vector dimensions against active Milvus collection schemas with explicit warning logging when existing server collections deviate from declared dimensions.
 - **Single & Multi-Collection ORM Routing** — Automatic collection creation and full multi-table query support: call `db.get_all()` across all registered collections simultaneously, scope queries by model class (`db.get_all(Model)` or `db[Model].get_all()`), or access repositories directly by attribute (`db.modelname`).
 - **Enterprise Ghost Audit Log (`_forensic_audit_log`)** — Global audit trail tracking `INSERT`, `UPDATE`, `SOFT_DELETE`, and `HARD_DELETE` operations for models inheriting from `ForensicModel` with safe JSON ISO-8601 datetime serialization.
 - **Automated Collection Memory Loading** — Transparent auto-loading (`load_collection`) into memory for pre-existing or offline Milvus collections upon connection.
