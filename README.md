@@ -31,7 +31,7 @@
 - **Bulk Vector Ingestion** — High-performance chunked bulk insertion (`insert_batch`) with automatic payload chunking and ID propagation.
 - **Async Client Support (`AsyncWMilvus`)** — Full non-blocking async mirror with `async with` context manager for FastAPI and asyncio applications.
 - **Schema Verification (`verify_schema`)** — Verification of Pydantic model vector dimensions against active Milvus collection schemas.
-- **Single & Multi-Collection ORM Routing** — Automatic collection creation and routing by model class (`db[Model]`), attribute (`db.modelname`), or main client auto-routing (`db.insert(instance)`).
+- **Single & Multi-Collection ORM Routing** — Automatic collection creation and full multi-table query support: call `db.get_all()` across all registered collections simultaneously, scope queries by model class (`db.get_all(Model)` or `db[Model].get_all()`), or access repositories directly by attribute (`db.modelname`).
 - **Enterprise Ghost Audit Log (`_forensic_audit_log`)** — Global audit trail tracking `INSERT`, `UPDATE`, `SOFT_DELETE`, and `HARD_DELETE` operations for models inheriting from `ForensicModel` with safe JSON ISO-8601 datetime serialization.
 - **Automated Collection Memory Loading** — Transparent auto-loading (`load_collection`) into memory for pre-existing or offline Milvus collections upon connection.
 - **Flexible Client Instantiation** — Versatile initialization supporting `WMilvus(uri, models=[...])`, `WMilvus(models=[...], uri=...)`, and config dictionaries without rigid positional restrictions.
