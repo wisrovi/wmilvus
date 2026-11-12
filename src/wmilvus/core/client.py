@@ -536,6 +536,7 @@ class CollectionRepository:
         record: BaseModel,
         user_id: Optional[int] = 1,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> BaseModel:
         """Insert a single typed Pydantic model instance into Milvus with forensic audit logging."""
         data_dict = record.model_dump(mode="json")
@@ -580,8 +581,9 @@ class CollectionRepository:
                     setattr(record, pk_name, generated_id)
                 rec_id = generated_id
 
-        with contextlib.suppress(Exception):
-            self.client.flush(collection_name=self.collection_name)
+        if auto_flush:
+            with contextlib.suppress(Exception):
+                self.client.flush(collection_name=self.collection_name)
 
         if self.forensic:
             record_ghost_audit(
@@ -600,6 +602,7 @@ class CollectionRepository:
         batch_size: int = 1000,
         user_id: Optional[int] = 1,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> dict[str, Any]:
         """Perform bulk insertion of vector records in configurable batch chunks."""
         if not records:
@@ -663,8 +666,9 @@ class CollectionRepository:
                 f"Inserted batch {batches_processed} ({len(chunk)} records) into '{self.collection_name}'"
             )
 
-        with contextlib.suppress(Exception):
-            self.client.flush(collection_name=self.collection_name)
+        if auto_flush:
+            with contextlib.suppress(Exception):
+                self.client.flush(collection_name=self.collection_name)
 
         if self.forensic and records:
             record_ghost_audit(
@@ -1070,6 +1074,7 @@ class CollectionRepository:
         record: BaseModel,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> BaseModel:
         """Update existing record in Milvus collection with forensic audit logging."""
         pk_name = self.pk_info["name"]
@@ -1115,8 +1120,9 @@ class CollectionRepository:
 
         self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
 
-        with contextlib.suppress(Exception):
-            self.client.flush(collection_name=self.collection_name)
+        if auto_flush:
+            with contextlib.suppress(Exception):
+                self.client.flush(collection_name=self.collection_name)
 
         if self.forensic:
             record_ghost_audit(
@@ -1132,6 +1138,11 @@ class CollectionRepository:
             )
 
         return record
+
+    def flush(self) -> None:
+        """Explicitly flush collection data to storage (use sparingly; Milvus handles flushing automatically)."""
+        with contextlib.suppress(Exception):
+            self.client.flush(collection_name=self.collection_name)
 
     def delete(
         self,
@@ -1322,10 +1333,13 @@ class WMilvus:
         record: BaseModel,
         user_id: Optional[int] = 1,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
-        return repo.insert(record, user_id=user_id, partition_name=partition_name)
+        return repo.insert(
+            record, user_id=user_id, partition_name=partition_name, auto_flush=auto_flush
+        )
 
     def insert_batch(
         self,
@@ -1333,13 +1347,18 @@ class WMilvus:
         batch_size: int = 1000,
         user_id: Optional[int] = 1,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> dict[str, Any]:
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
         model_cls = records[0].__class__
         repo = self[model_cls]
         return repo.insert_batch(
-            records, batch_size=batch_size, user_id=user_id, partition_name=partition_name
+            records,
+            batch_size=batch_size,
+            user_id=user_id,
+            partition_name=partition_name,
+            auto_flush=auto_flush,
         )
 
     def get_all(
@@ -1756,10 +1775,27 @@ class WMilvus:
         record: BaseModel,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
-        return repo.update(record_id, record, user_id=user_id, partition_name=partition_name)
+        return repo.update(
+            record_id,
+            record,
+            user_id=user_id,
+            partition_name=partition_name,
+            auto_flush=auto_flush,
+        )
+
+    def flush(self, model: Optional[Union[type[BaseModel], str]] = None) -> None:
+        """Explicitly flush collection data to storage (use sparingly; Milvus handles flushing automatically)."""
+        if model is not None:
+            self._resolve_repo(model).flush()
+        elif len(self.repositories) == 1:
+            next(iter(self.repositories.values())).flush()
+        else:
+            for repo in self.repositories.values():
+                repo.flush()
 
     def delete(
         self,
@@ -1879,9 +1915,14 @@ class AsyncCollectionRepository:
         record: BaseModel,
         user_id: Optional[int] = 1,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> BaseModel:
         return await asyncio.to_thread(
-            self._repo.insert, record, user_id=user_id, partition_name=partition_name
+            self._repo.insert,
+            record,
+            user_id=user_id,
+            partition_name=partition_name,
+            auto_flush=auto_flush,
         )
 
     async def insert_batch(
@@ -1890,6 +1931,7 @@ class AsyncCollectionRepository:
         batch_size: int = 1000,
         user_id: Optional[int] = 1,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._repo.insert_batch,
@@ -1897,6 +1939,7 @@ class AsyncCollectionRepository:
             batch_size=batch_size,
             user_id=user_id,
             partition_name=partition_name,
+            auto_flush=auto_flush,
         )
 
     async def get_all(
@@ -2058,6 +2101,7 @@ class AsyncCollectionRepository:
         record: BaseModel,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> BaseModel:
         return await asyncio.to_thread(
             self._repo.update,
@@ -2065,7 +2109,12 @@ class AsyncCollectionRepository:
             record,
             user_id=user_id,
             partition_name=partition_name,
+            auto_flush=auto_flush,
         )
+
+    async def flush(self) -> None:
+        """Explicitly flush collection data to storage asynchronously."""
+        await asyncio.to_thread(self._repo.flush)
 
     async def delete(
         self,
@@ -2154,10 +2203,13 @@ class AsyncWMilvus:
         record: BaseModel,
         user_id: Optional[int] = 1,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
-        return await repo.insert(record, user_id=user_id, partition_name=partition_name)
+        return await repo.insert(
+            record, user_id=user_id, partition_name=partition_name, auto_flush=auto_flush
+        )
 
     async def insert_batch(
         self,
@@ -2165,13 +2217,18 @@ class AsyncWMilvus:
         batch_size: int = 1000,
         user_id: Optional[int] = 1,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> dict[str, Any]:
         if not records:
             return {"inserted_count": 0, "batches_processed": 0}
         model_cls = records[0].__class__
         repo = self[model_cls]
         return await repo.insert_batch(
-            records, batch_size=batch_size, user_id=user_id, partition_name=partition_name
+            records,
+            batch_size=batch_size,
+            user_id=user_id,
+            partition_name=partition_name,
+            auto_flush=auto_flush,
         )
 
     async def get_all(
@@ -2546,10 +2603,29 @@ class AsyncWMilvus:
         record: BaseModel,
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
+        auto_flush: bool = False,
     ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
-        return await repo.update(record_id, record, user_id=user_id, partition_name=partition_name)
+        return await repo.update(
+            record_id,
+            record,
+            user_id=user_id,
+            partition_name=partition_name,
+            auto_flush=auto_flush,
+        )
+
+    async def flush(self, model: Optional[Union[type[BaseModel], str]] = None) -> None:
+        """Explicitly flush collection data to storage asynchronously."""
+        if model is not None:
+            repo = self._resolve_repo(model)
+            await repo.flush()
+        elif len(self.repositories) == 1:
+            repo = next(iter(self.repositories.values()))
+            await repo.flush()
+        else:
+            for repo in self.repositories.values():
+                await repo.flush()
 
     async def delete(
         self,
