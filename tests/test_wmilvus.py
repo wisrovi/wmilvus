@@ -3,6 +3,7 @@
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 from pydantic import BaseModel, Field
 from wmilvus import AsyncWMilvus, FieldVector, ForensicModel, VectorSearchError, WMilvus
 
@@ -1171,7 +1172,6 @@ def test_scalar_only_model_without_vector_fields(mock_milvus_client: MagicMock) 
     5. Vector search operations on scalar models raise VectorSearchError.
     6. verify_schema() succeeds and reports has_vector=False.
     """
-    import pytest
 
     mock_instance = MagicMock()
     mock_instance.has_collection.return_value = False
@@ -1256,3 +1256,159 @@ def test_scalar_only_model_without_vector_fields(mock_milvus_client: MagicMock) 
     schema_status = db[Category].verify_schema()
     assert schema_status["status"] == "VALID"
     assert schema_status["has_vector"] is False
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_flush_behavior_and_manual_flush(mock_milvus_client: MagicMock) -> None:
+    """Test that flush() is NOT invoked by default on insert, insert_batch, and update,
+
+    and verify that explicit flush() calls and auto_flush=True parameters work as expected.
+
+    Validation steps:
+    1. Single insert without auto_flush: verifies client.flush is NOT called (prevents Milvus segment fragmentation).
+    2. Single insert with auto_flush=True: verifies client.flush IS called once.
+    3. Batch insert without auto_flush: verifies client.flush is NOT called.
+    4. Batch insert with auto_flush=True: verifies client.flush IS called.
+    5. Update without auto_flush: verifies client.flush is NOT called.
+    6. Update with auto_flush=True: verifies client.flush IS called.
+    7. Explicit db.flush() and repo.flush(): verifies manual administrative flushing works.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.get_collection_stats.return_value = {"row_count": 0}
+    mock_instance.describe_collection.return_value = {
+        "collection_name": "person",
+        "fields": [
+            {"name": "id", "type": "VARCHAR"},
+            {"name": "embedding", "type": "FLOAT_VECTOR", "params": {"dim": 4}},
+        ],
+    }
+    mock_instance.query.return_value = [
+        {
+            "id": "p1",
+            "name": "Alice",
+            "age": 28,
+            "is_active": True,
+            "embedding": [0.1, 0.2, 0.3, 0.4],
+        }
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    db = WMilvus(Person, {"uri": "http://localhost:19530"})
+    mock_instance.flush.reset_mock()
+
+    # Step 1: Default insert should NOT call flush to prevent server segment fragmentation
+    person1 = Person(id="p1", name="Alice", age=28, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4])
+    db.insert(person1)
+    assert mock_instance.flush.call_count == 0, "Insert must not trigger flush by default"
+
+    # Step 2: Insert with auto_flush=True should call flush
+    person2 = Person(id="p2", name="Bob", age=32, is_active=True, embedding=[0.2, 0.3, 0.4, 0.5])
+    db.insert(person2, auto_flush=True)
+    assert mock_instance.flush.call_count == 1, "Insert with auto_flush=True must trigger flush"
+
+    # Step 3: Default insert_batch should NOT call flush
+    mock_instance.flush.reset_mock()
+    db.insert_batch([person1, person2])
+    assert mock_instance.flush.call_count == 0, "Batch insert must not trigger flush by default"
+
+    # Step 4: Batch insert with auto_flush=True should call flush once
+    db.insert_batch([person1, person2], auto_flush=True)
+    assert (
+        mock_instance.flush.call_count == 1
+    ), "Batch insert with auto_flush=True must trigger flush"
+
+    # Step 5: Default update should NOT call flush
+    mock_instance.flush.reset_mock()
+    person1.name = "Alice Updated"
+    db.update("p1", person1)
+    assert mock_instance.flush.call_count == 0, "Update must not trigger flush by default"
+
+    # Step 6: Update with auto_flush=True should call flush
+    db.update("p1", person1, auto_flush=True)
+    assert mock_instance.flush.call_count == 1, "Update with auto_flush=True must trigger flush"
+
+    # Step 7: Explicit manual flush on repository and client
+    mock_instance.flush.reset_mock()
+    db[Person].flush()
+    assert mock_instance.flush.call_count == 1, "repo.flush() must explicitly call client.flush"
+
+    mock_instance.flush.reset_mock()
+    db.flush()
+    assert mock_instance.flush.call_count == 1, "db.flush() must explicitly call client.flush"
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_async_flush_behavior(mock_milvus_client: MagicMock) -> None:
+    """Test non-blocking async flush behavior on AsyncWMilvus and AsyncCollectionRepository.
+
+    Validates that:
+    1. Async insert, insert_batch, and update do not flush by default.
+    2. Passing auto_flush=True executes flush asynchronously.
+    3. Explicit await async_db.flush() and await async_repo.flush() succeed non-blockingly.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_instance.get_collection_stats.return_value = {"row_count": 0}
+    mock_instance.describe_collection.return_value = {
+        "collection_name": "person",
+        "fields": [
+            {"name": "id", "type": "VARCHAR"},
+            {"name": "embedding", "type": "FLOAT_VECTOR", "params": {"dim": 4}},
+        ],
+    }
+    mock_instance.query.return_value = [
+        {
+            "id": "p1",
+            "name": "Alice",
+            "age": 28,
+            "is_active": True,
+            "embedding": [0.1, 0.2, 0.3, 0.4],
+        }
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    async def _run() -> None:
+        async_db = AsyncWMilvus(Person, {"uri": "http://localhost:19530"})
+        mock_instance.flush.reset_mock()
+
+        p = Person(id="p1", name="Alice", age=28, is_active=True, embedding=[0.1, 0.2, 0.3, 0.4])
+
+        # Default async insert does not flush
+        await async_db.insert(p)
+        assert mock_instance.flush.call_count == 0
+
+        # Async insert with auto_flush=True flushes
+        await async_db.insert(p, auto_flush=True)
+        assert mock_instance.flush.call_count == 1
+
+        # Default async insert_batch does not flush
+        mock_instance.flush.reset_mock()
+        await async_db.insert_batch([p])
+        assert mock_instance.flush.call_count == 0
+
+        # Async insert_batch with auto_flush=True flushes
+        await async_db.insert_batch([p], auto_flush=True)
+        assert mock_instance.flush.call_count == 1
+
+        # Default async update does not flush
+        mock_instance.flush.reset_mock()
+        await async_db.update("p1", p)
+        assert mock_instance.flush.call_count == 0
+
+        # Async update with auto_flush=True flushes
+        await async_db.update("p1", p, auto_flush=True)
+        assert mock_instance.flush.call_count == 1
+
+        # Explicit async flush
+        mock_instance.flush.reset_mock()
+        await async_db.flush()
+        assert mock_instance.flush.call_count == 1
+
+        mock_instance.flush.reset_mock()
+        await async_db[Person].flush()
+        assert mock_instance.flush.call_count == 1
+
+    import asyncio
+
+    asyncio.run(_run())
