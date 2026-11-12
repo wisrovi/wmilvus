@@ -34,6 +34,7 @@
 - **High-Speed Batch Updates (`update_batch`)** — Update multiple records in a single round-trip via `db.update_batch([records])` across synchronous and asynchronous clients, with vector preservation and batched audit trails.
 - **In-Memory Ghost Collection Caching** — Verifications of collection existence for `_forensic_audit_log` are memoized in memory, eliminating redundant gRPC `has_collection` calls on every write.
 - **Selective Scalar Querying for Updates** — Pre-update queries for `ForensicModel` audit snapshots automatically exclude 512-dimension vectors when the incoming record already supplies the vector, saving bandwidth and network overhead.
+- **Explicit `data_before` Injection & In-Memory LRU Entity Cache** — Update operations (`update()`, `update_batch()`) allow direct injection of previous state (`data_before=...`) and leverage an internal LRU cache populated by `insert()` and `get_by_field()`. This avoids synchronous Milvus read queries entirely, plummeting single-record update latency down to `< 5ms`.
 - **Bulk Vector Ingestion** — High-performance chunked bulk insertion (`insert_batch`) with automatic payload chunking and ID propagation.
 - **Async Client Support (`AsyncWMilvus`)** — Full non-blocking async mirror with `async with` context manager for FastAPI and asyncio applications.
 - **Schema Verification & Dimension Mismatch Detection** — Verification of Pydantic model vector dimensions against active Milvus collection schemas with explicit warning logging when existing server collections deviate from declared dimensions.
@@ -151,6 +152,15 @@ await async_db.update_batch(updated_users)
 ### Non-Blocking Forensic Audit Dispatcher
 
 When using `ForensicModel`, WMilvus automatically offloads audit trail persistence to an asynchronous background worker (`ForensicAuditDispatcher`) with in-memory caching. This removes over 150-200ms of latency per write while guaranteeing all audit entries are safely flushed on process termination (`atexit`), `close()`, or `flush()`.
+
+### Zero-Latency Updates via `data_before` & In-Memory LRU Cache
+
+To eliminate the ~50-70ms read query normally needed to capture previous state for forensic auditing (`ForensicModel`):
+- **Explicit Injection**: If your microservice already has the previous record in memory, pass it directly:
+  ```python
+  db.update(user_id, updated_user, data_before=previous_user)
+  ```
+- **In-Memory LRU Cache**: Entities recently inserted or queried via `get_by_field()` are automatically cached in an internal LRU cache. Subsequent updates on those IDs automatically resolve `data_before` in microsecond memory access, skipping network read calls to Milvus entirely.
 
 ### Read-After-Write Consistency & Manual Flushing
 
