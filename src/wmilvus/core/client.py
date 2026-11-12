@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any, Optional, Union
@@ -669,6 +670,31 @@ class CollectionRepository:
                     max_size=buffer_max_size,
                 )
 
+        self._entity_cache: OrderedDict[Any, dict[str, Any]] = OrderedDict()
+        self._entity_cache_max_size: int = kwargs.get("entity_cache_size", 2048)
+        self._cache_lock = threading.Lock()
+
+    def _cache_put(self, pk_val: Any, data: dict[str, Any]) -> None:
+        """Store entity dictionary into the in-memory LRU cache."""
+        if pk_val is None:
+            return
+        with self._cache_lock:
+            if pk_val in self._entity_cache:
+                self._entity_cache.move_to_end(pk_val)
+            self._entity_cache[pk_val] = dict(data)
+            if len(self._entity_cache) > self._entity_cache_max_size:
+                self._entity_cache.popitem(last=False)
+
+    def _cache_get(self, pk_val: Any) -> Optional[dict[str, Any]]:
+        """Retrieve entity dictionary from the in-memory LRU cache."""
+        if pk_val is None:
+            return None
+        with self._cache_lock:
+            if pk_val in self._entity_cache:
+                self._entity_cache.move_to_end(pk_val)
+                return dict(self._entity_cache[pk_val])
+            return None
+
     def _deserialize_record(self, item: dict[str, Any]) -> BaseModel:
         """Deserialize raw Milvus query dictionary into the bound Pydantic model."""
         vector_field_name = self.vector_meta["field_name"]
@@ -897,6 +923,9 @@ class CollectionRepository:
                         setattr(record, pk_name, generated_id)
                     rec_id = generated_id
 
+        if rec_id is not None:
+            self._cache_put(rec_id, data_dict)
+
         if auto_flush:
             self.flush()
 
@@ -968,6 +997,10 @@ class CollectionRepository:
                 self.client.upsert(
                     collection_name=self.collection_name, data=payload_batch, **kwargs
                 )
+                for rec in chunk:
+                    rid = getattr(rec, pk_name, None)
+                    if rid is not None:
+                        self._cache_put(rid, rec.model_dump(mode="json"))
             else:
                 res = self.client.insert(
                     collection_name=self.collection_name, data=payload_batch, **kwargs
@@ -976,6 +1009,7 @@ class CollectionRepository:
                     for rec, gid in zip(chunk, res["ids"]):
                         if hasattr(rec, pk_name):
                             setattr(rec, pk_name, gid)
+                        self._cache_put(gid, rec.model_dump(mode="json"))
 
             batches_processed += 1
             logger.info(
@@ -1071,7 +1105,11 @@ class CollectionRepository:
         )
         if not raw_items:
             return None
-        return self._deserialize_record(raw_items[0])
+        res_record = self._deserialize_record(raw_items[0])
+        pk_val = getattr(res_record, self.pk_info["name"], None)
+        if pk_val is not None:
+            self._cache_put(pk_val, raw_items[0])
+        return res_record
 
     def filter_by(
         self,
@@ -1391,6 +1429,7 @@ class CollectionRepository:
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
         auto_flush: bool = False,
+        data_before: Optional[Union[BaseModel, dict[str, Any]]] = None,
     ) -> BaseModel:
         """Update existing record in Milvus collection with forensic audit logging."""
         pk_name = self.pk_info["name"]
@@ -1403,8 +1442,19 @@ class CollectionRepository:
             and (not isinstance(incoming_vec, list) or len(incoming_vec) > 0)
         )
 
-        data_before = None
-        needs_before = self.forensic or (not has_incoming_vec and self.has_vector)
+        data_before_dict: Optional[dict[str, Any]] = None
+        if data_before is not None:
+            if isinstance(data_before, BaseModel):
+                data_before_dict = data_before.model_dump(mode="json")
+            elif isinstance(data_before, dict):
+                data_before_dict = dict(data_before)
+
+        if data_before_dict is None:
+            data_before_dict = self._cache_get(record_id)
+
+        needs_before = (data_before_dict is None) and (
+            self.forensic or (not has_incoming_vec and self.has_vector)
+        )
         if needs_before:
             output_fields = None if not has_incoming_vec else ["*"]
             before_item = self.get_by_field(
@@ -1414,17 +1464,20 @@ class CollectionRepository:
                 **{pk_name: record_id},
             )
             if before_item:
-                data_before = before_item.model_dump(mode="json")
-                if not has_incoming_vec and self.has_vector:
-                    existing_vec = getattr(before_item, vector_field_name, None)
-                    if existing_vec:
-                        incoming_vec = (
-                            existing_vec.tolist()
-                            if isinstance(existing_vec, np.ndarray)
-                            else list(existing_vec)
-                        )
-                        with contextlib.suppress(Exception):
-                            setattr(record, vector_field_name, incoming_vec)
+                data_before_dict = before_item.model_dump(mode="json")
+                if rec_id := getattr(before_item, pk_name, None):
+                    self._cache_put(rec_id, data_before_dict)
+
+        if not has_incoming_vec and self.has_vector and data_before_dict:
+            existing_vec = data_before_dict.get(vector_field_name)
+            if existing_vec:
+                incoming_vec = (
+                    existing_vec.tolist()
+                    if isinstance(existing_vec, np.ndarray)
+                    else list(existing_vec)
+                )
+                with contextlib.suppress(Exception):
+                    setattr(record, vector_field_name, incoming_vec)
 
         if not self.has_vector:
             vector_val = [0.0] * self.vector_meta["dim"]
@@ -1448,6 +1501,8 @@ class CollectionRepository:
         else:
             self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
 
+        self._cache_put(record_id, data_dict)
+
         if auto_flush:
             self.flush()
 
@@ -1457,8 +1512,8 @@ class CollectionRepository:
                 action_type="UPDATE",
                 table_name=self.collection_name,
                 record_id=str(record_id),
-                data_before={k: v for k, v in data_before.items() if k != vector_field_name}
-                if data_before
+                data_before={k: v for k, v in data_before_dict.items() if k != vector_field_name}
+                if data_before_dict
                 else None,
                 data_after={k: v for k, v in data_dict.items() if k != vector_field_name},
                 user_id=user_id,
@@ -1573,6 +1628,9 @@ class CollectionRepository:
 
         self.client.delete(collection_name=self.collection_name, ids=[record_id], **kwargs)
 
+        with self._cache_lock:
+            self._entity_cache.pop(record_id, None)
+
         if self.forensic:
             record_ghost_audit(
                 client=self.client,
@@ -1607,6 +1665,10 @@ class CollectionRepository:
             kwargs["partition_name"] = partition_name
 
         res = self.client.delete(collection_name=self.collection_name, ids=record_ids, **kwargs)
+
+        with self._cache_lock:
+            for rid in record_ids:
+                self._entity_cache.pop(rid, None)
 
         if self.forensic:
             record_ghost_audit(
@@ -2214,6 +2276,7 @@ class WMilvus:
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
         auto_flush: bool = False,
+        data_before: Optional[Union[BaseModel, dict[str, Any]]] = None,
     ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
@@ -2223,6 +2286,7 @@ class WMilvus:
             user_id=user_id,
             partition_name=partition_name,
             auto_flush=auto_flush,
+            data_before=data_before,
         )
 
     def update_batch(
@@ -2569,6 +2633,7 @@ class AsyncCollectionRepository:
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
         auto_flush: bool = False,
+        data_before: Optional[Union[BaseModel, dict[str, Any]]] = None,
     ) -> BaseModel:
         return await asyncio.to_thread(
             self._repo.update,
@@ -2577,6 +2642,7 @@ class AsyncCollectionRepository:
             user_id=user_id,
             partition_name=partition_name,
             auto_flush=auto_flush,
+            data_before=data_before,
         )
 
     async def update_batch(
@@ -3088,6 +3154,7 @@ class AsyncWMilvus:
         user_id: Optional[int] = None,
         partition_name: Optional[str] = None,
         auto_flush: bool = False,
+        data_before: Optional[Union[BaseModel, dict[str, Any]]] = None,
     ) -> BaseModel:
         model_cls = record.__class__
         repo = self[model_cls]
@@ -3097,6 +3164,7 @@ class AsyncWMilvus:
             user_id=user_id,
             partition_name=partition_name,
             auto_flush=auto_flush,
+            data_before=data_before,
         )
 
     async def update_batch(
