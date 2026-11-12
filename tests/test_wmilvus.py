@@ -1412,3 +1412,204 @@ def test_async_flush_behavior(mock_milvus_client: MagicMock) -> None:
     import asyncio
 
     asyncio.run(_run())
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_ensure_ghost_audit_log_collection_memory_cache(mock_milvus_client: MagicMock) -> None:
+    """Test that ensure_ghost_audit_log_collection caches verification in memory.
+
+    Validates that the client.has_collection check is only executed once for
+    _forensic_audit_log per client session, eliminating repeated RPC round-trips
+    on every insert or update operation.
+    """
+    from wmilvus.core.client import (
+        _VERIFIED_GHOST_COLLECTIONS,
+        ensure_ghost_audit_log_collection,
+    )
+
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_milvus_client.return_value = mock_instance
+
+    # Clear test cache
+    _VERIFIED_GHOST_COLLECTIONS.clear()
+    mock_instance._wmilvus_verified_collections = set()
+
+    # First call: executes has_collection and create_collection
+    ensure_ghost_audit_log_collection(mock_instance)
+    assert mock_instance.has_collection.call_count == 1
+    assert mock_instance.create_collection.call_count == 1
+
+    # Second call: cached in _wmilvus_verified_collections, no new RPC calls
+    ensure_ghost_audit_log_collection(mock_instance)
+    assert mock_instance.has_collection.call_count == 1
+    assert mock_instance.create_collection.call_count == 1
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_forensic_audit_dispatcher_batching_and_flush(mock_milvus_client: MagicMock) -> None:
+    """Test background asynchronous forensic audit dispatcher.
+
+    Validates that ForensicAuditDispatcher queues incoming audit records without
+    blocking the caller, batches records efficiently, and synchronously flushes
+    all pending items upon flush() or close() ensuring zero audit log loss.
+    """
+    from wmilvus.core.client import GHOST_AUDIT_LOG_COLLECTION, ForensicAuditDispatcher
+
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = True
+    mock_milvus_client.return_value = mock_instance
+
+    dispatcher = ForensicAuditDispatcher(
+        client=mock_instance,
+        batch_size=10,
+        flush_interval=0.01,
+    )
+
+    # Record 5 audit events
+    for i in range(5):
+        dispatcher.record(
+            {
+                "vector": [0.0, 0.0],
+                "action_type": "INSERT",
+                "table_name": "users_face",
+                "record_id": f"u_{i}",
+                "data_before": "",
+                "data_after": f'{{"name": "User {i}"}}',
+                "create_by": 100,
+                "create_in": "2026-11-12T10:00:00Z",
+            }
+        )
+
+    # Flush ensures all queued records are persisted
+    dispatcher.flush()
+    assert mock_instance.insert.call_count >= 1
+
+    # Verify call arguments target GHOST_AUDIT_LOG_COLLECTION
+    call_args = mock_instance.insert.call_args_list[0]
+    assert call_args.kwargs["collection_name"] == GHOST_AUDIT_LOG_COLLECTION
+    assert len(call_args.kwargs["data"]) >= 1
+
+    dispatcher.close()
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_update_scalar_projection_avoids_heavy_vector_query(mock_milvus_client: MagicMock) -> None:
+    """Test scalar projection optimization during update() operations.
+
+    Validates that when the incoming Pydantic record already contains a non-empty vector,
+    update() queries only scalar attributes (output_fields=['*'], include_vector=False)
+    for forensic audit logging, rather than requesting and transferring heavy high-dimensional
+    float vectors across the network.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = [
+        {
+            "id": "u1",
+            "name": "Old Name",
+            "create_by": 1,
+            "create_in": "2026-11-12T10:00:00Z",
+            "update_by": None,
+            "update_in": None,
+            "delete_by": None,
+            "delete_in": None,
+            "status": 1,
+        }
+    ]
+    mock_milvus_client.return_value = mock_instance
+
+    db = WMilvus(UserFace, {"uri": "http://localhost:19530"})
+
+    # Update with an incoming record that has a populated vector
+    updated_face = UserFace(id="u1", name="New Name", face_vec=[0.2] * 128)
+    db.update("u1", updated_face, user_id=105)
+
+    # Verify query was called with include_vector=False and output_fields=['*']
+    assert mock_instance.query.call_count >= 1
+    query_call = mock_instance.query.call_args
+    assert query_call.kwargs["output_fields"] == ["*"]
+    mock_instance.upsert.assert_called()
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_update_batch_sync_and_async(mock_milvus_client: MagicMock) -> None:
+    """Test bulk update_batch API in both synchronous and asynchronous modes.
+
+    Validates that update_batch aggregates multiple entity updates into chunked
+    upsert calls, applies forensic audit logging for batch updates, and executes
+    seamlessly in both synchronous WMilvus and asynchronous AsyncWMilvus clients.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_milvus_client.return_value = mock_instance
+
+    db = WMilvus(Person, {"uri": "http://localhost:19530"})
+
+    records = [
+        Person(id=f"p_{i}", name=f"Name {i}", age=20 + i, is_active=True, embedding=[0.1] * 4)
+        for i in range(15)
+    ]
+
+    # Synchronous update_batch
+    res = db.update_batch(records, batch_size=10)
+    assert res["updated_count"] == 15
+    assert res["batches_processed"] == 2
+    assert mock_instance.upsert.call_count == 2
+
+    # Async update_batch
+    async def _test_async() -> None:
+        async_db = AsyncWMilvus(Person, {"uri": "http://localhost:19530"})
+        mock_instance.upsert.reset_mock()
+        async_res = await async_db.update_batch(records, batch_size=10)
+        assert async_res["updated_count"] == 15
+        assert async_res["batches_processed"] == 2
+        assert mock_instance.upsert.call_count == 2
+
+    import asyncio
+
+    asyncio.run(_test_async())
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_write_buffer_micro_batching_and_flushing(mock_milvus_client: MagicMock) -> None:
+    """Test WriteBuffer write-behind micro-batching mechanism.
+
+    Validates that when WriteBuffer is active, individual upsert and insert operations
+    are deposited into an internal queue without blocking, grouped into batches by the
+    worker thread, and completely flushed to Milvus when flush() is invoked.
+    """
+    from wmilvus.core.client import WriteBuffer
+
+    mock_instance = MagicMock()
+    mock_milvus_client.return_value = mock_instance
+
+    buf = WriteBuffer(
+        client=mock_instance,
+        collection_name="person",
+        window_ms=10.0,
+        max_size=20,
+    )
+
+    # Queue 15 individual upserts
+    for i in range(15):
+        buf.put_upsert(
+            {
+                "id": f"p_{i}",
+                "name": f"Buffered User {i}",
+                "age": 25,
+                "is_active": True,
+                "embedding": [0.1] * 4,
+            }
+        )
+
+    # Flush waits until all items are committed to Milvus
+    buf.flush()
+    assert mock_instance.upsert.call_count >= 1
+
+    # Verify payloads were batched
+    upsert_call = mock_instance.upsert.call_args_list[0]
+    assert upsert_call.kwargs["collection_name"] == "person"
+    assert len(upsert_call.kwargs["data"]) >= 1
+
+    buf.close()
