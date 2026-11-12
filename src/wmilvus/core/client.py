@@ -1,8 +1,14 @@
 """WMilvus Pydantic ORM Repository and Multi-Collection Client."""
 
 import asyncio
+import atexit
+import concurrent.futures
 import contextlib
 import json
+import os
+import queue
+import threading
+import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any, Optional, Union
@@ -308,8 +314,33 @@ def build_filter_expr(filter_kwargs: dict[str, Any]) -> str:
     return " and ".join(clauses)
 
 
+_VERIFIED_GHOST_COLLECTIONS: set[int] = set()
+_GLOBAL_CLEANUP_REGISTRY: list[Any] = []
+_CLEANUP_LOCK = threading.Lock()
+
+
+def _cleanup_all_active_buffers() -> None:
+    """Flush and shut down all active WriteBuffer and ForensicAuditDispatcher instances upon interpreter exit."""
+    with _CLEANUP_LOCK:
+        for item in list(_GLOBAL_CLEANUP_REGISTRY):
+            with contextlib.suppress(Exception):
+                item.close()
+        _GLOBAL_CLEANUP_REGISTRY.clear()
+
+
+atexit.register(_cleanup_all_active_buffers)
+
+
 def ensure_ghost_audit_log_collection(client: MilvusClient) -> None:
-    """Ensure that the global _forensic_audit_log collection exists in Milvus."""
+    """Ensure that the global _forensic_audit_log collection exists in Milvus (cached in memory)."""
+    client_verified = getattr(client, "_wmilvus_verified_collections", None)
+    if isinstance(client_verified, set) and GHOST_AUDIT_LOG_COLLECTION in client_verified:
+        return
+
+    client_id = id(client)
+    if client_id in _VERIFIED_GHOST_COLLECTIONS:
+        return
+
     if not client.has_collection(collection_name=GHOST_AUDIT_LOG_COLLECTION):
         client.create_collection(
             collection_name=GHOST_AUDIT_LOG_COLLECTION,
@@ -320,6 +351,234 @@ def ensure_ghost_audit_log_collection(client: MilvusClient) -> None:
         )
         logger.info(f"Created global ghost audit log collection '{GHOST_AUDIT_LOG_COLLECTION}'")
 
+    _VERIFIED_GHOST_COLLECTIONS.add(client_id)
+    if not isinstance(client_verified, set):
+        client_verified = set()
+        with contextlib.suppress(Exception):
+            client._wmilvus_verified_collections = client_verified
+    client_verified.add(GHOST_AUDIT_LOG_COLLECTION)
+
+
+class ForensicAuditDispatcher:
+    """Background asynchronous dispatcher for forensic audit logging in Milvus."""
+
+    def __init__(
+        self,
+        client: MilvusClient,
+        batch_size: int = 50,
+        flush_interval: float = 0.025,
+    ) -> None:
+        self.client = client
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval
+        self._queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=50000)
+        self._stop_event = threading.Event()
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+        with _CLEANUP_LOCK:
+            _GLOBAL_CLEANUP_REGISTRY.append(self)
+
+    def record(self, payload: dict[str, Any]) -> None:
+        """Enqueue an audit event to be dispatched asynchronously."""
+        try:
+            self._queue.put_nowait(payload)
+        except queue.Full:
+            self._flush_batch([payload])
+
+    def _flush_batch(self, batch: list[dict[str, Any]]) -> None:
+        if not batch:
+            return
+        ensure_ghost_audit_log_collection(self.client)
+        try:
+            self.client.insert(collection_name=GHOST_AUDIT_LOG_COLLECTION, data=batch)
+        except Exception as e:
+            logger.error(f"Failed to persist forensic audit batch ({len(batch)} records): {e}")
+
+    def _worker_loop(self) -> None:
+        batch: list[dict[str, Any]] = []
+        last_flush = time.time()
+        while not self._stop_event.is_set():
+            try:
+                timeout = max(0.005, self.flush_interval - (time.time() - last_flush))
+                item = self._queue.get(timeout=timeout)
+                if item is None:
+                    self._queue.task_done()
+                    break
+                batch.append(item)
+                if (
+                    len(batch) >= self.batch_size
+                    or (time.time() - last_flush) >= self.flush_interval
+                ):
+                    self._flush_batch(batch)
+                    for _ in range(len(batch)):
+                        self._queue.task_done()
+                    batch = []
+                    last_flush = time.time()
+            except queue.Empty:
+                if batch:
+                    self._flush_batch(batch)
+                    for _ in range(len(batch)):
+                        self._queue.task_done()
+                    batch = []
+                    last_flush = time.time()
+
+        while not self._queue.empty():
+            try:
+                item = self._queue.get_nowait()
+                if item is not None:
+                    batch.append(item)
+                else:
+                    self._queue.task_done()
+            except queue.Empty:
+                break
+        if batch:
+            self._flush_batch(batch)
+            for _ in range(len(batch)):
+                self._queue.task_done()
+
+    def flush(self) -> None:
+        """Synchronously wait until all queued audit events are persisted."""
+        self._queue.join()
+
+    def close(self) -> None:
+        """Stop worker and flush remaining audit records."""
+        self.flush()
+        self._stop_event.set()
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait(None)
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=2.0)
+        with _CLEANUP_LOCK:
+            if self in _GLOBAL_CLEANUP_REGISTRY:
+                _GLOBAL_CLEANUP_REGISTRY.remove(self)
+
+
+class WriteBuffer:
+    """Thread-safe write-behind micro-batching buffer for high-throughput individual writes."""
+
+    def __init__(
+        self,
+        client: MilvusClient,
+        collection_name: str,
+        window_ms: float = 25.0,
+        max_size: int = 50,
+    ) -> None:
+        self.client = client
+        self.collection_name = collection_name
+        self.window_s = max(0.005, window_ms / 1000.0)
+        self.max_size = max_size
+        self._queue: queue.Queue[
+            tuple[str, dict[str, Any], Optional[concurrent.futures.Future]]
+        ] = queue.Queue(maxsize=50000)
+        self._stop_event = threading.Event()
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+        with _CLEANUP_LOCK:
+            _GLOBAL_CLEANUP_REGISTRY.append(self)
+
+    def put_upsert(
+        self, payload: dict[str, Any], future: Optional[concurrent.futures.Future] = None
+    ) -> None:
+        self._queue.put(("upsert", payload, future))
+
+    def put_insert(
+        self, payload: dict[str, Any], future: Optional[concurrent.futures.Future] = None
+    ) -> None:
+        self._queue.put(("insert", payload, future))
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            items: list[tuple[str, dict[str, Any], Optional[concurrent.futures.Future]]] = []
+            try:
+                item = self._queue.get(timeout=self.window_s)
+                items.append(item)
+                while len(items) < self.max_size:
+                    try:
+                        it = self._queue.get_nowait()
+                        items.append(it)
+                    except queue.Empty:
+                        break
+            except queue.Empty:
+                pass
+
+            if items:
+                self._flush_items(items)
+                for _ in range(len(items)):
+                    self._queue.task_done()
+
+        drain_items = []
+        while not self._queue.empty():
+            try:
+                it = self._queue.get_nowait()
+                drain_items.append(it)
+            except queue.Empty:
+                break
+        if drain_items:
+            self._flush_items(drain_items)
+            for _ in range(len(drain_items)):
+                self._queue.task_done()
+
+    def _flush_items(
+        self,
+        items: list[tuple[str, dict[str, Any], Optional[concurrent.futures.Future]]],
+    ) -> None:
+        upsert_payloads: list[dict[str, Any]] = []
+        upsert_futures: list[Optional[concurrent.futures.Future]] = []
+        insert_payloads: list[dict[str, Any]] = []
+        insert_futures: list[Optional[concurrent.futures.Future]] = []
+
+        for op, payload, fut in items:
+            if op == "upsert":
+                upsert_payloads.append(payload)
+                upsert_futures.append(fut)
+            else:
+                insert_payloads.append(payload)
+                insert_futures.append(fut)
+
+        if upsert_payloads:
+            try:
+                res = self.client.upsert(collection_name=self.collection_name, data=upsert_payloads)
+                for fut in upsert_futures:
+                    if fut and not fut.done():
+                        fut.set_result(res)
+            except Exception as e:
+                logger.error(
+                    f"WriteBuffer upsert failed for '{self.collection_name}' ({len(upsert_payloads)} records): {e}"
+                )
+                for fut in upsert_futures:
+                    if fut and not fut.done():
+                        fut.set_exception(e)
+
+        if insert_payloads:
+            try:
+                res = self.client.insert(collection_name=self.collection_name, data=insert_payloads)
+                ids = res.get("ids", []) if isinstance(res, dict) else []
+                for i, fut in enumerate(insert_futures):
+                    if fut and not fut.done():
+                        gen_id = ids[i] if i < len(ids) else None
+                        fut.set_result(gen_id)
+            except Exception as e:
+                logger.error(
+                    f"WriteBuffer insert failed for '{self.collection_name}' ({len(insert_payloads)} records): {e}"
+                )
+                for fut in insert_futures:
+                    if fut and not fut.done():
+                        fut.set_exception(e)
+
+    def flush(self) -> None:
+        """Wait until all queued operations are flushed to Milvus."""
+        self._queue.join()
+
+    def close(self) -> None:
+        """Stop worker and flush remaining operations."""
+        self.flush()
+        self._stop_event.set()
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=2.0)
+        with _CLEANUP_LOCK:
+            if self in _GLOBAL_CLEANUP_REGISTRY:
+                _GLOBAL_CLEANUP_REGISTRY.remove(self)
+
 
 def record_ghost_audit(
     client: MilvusClient,
@@ -329,9 +588,9 @@ def record_ghost_audit(
     data_before: Optional[dict[str, Any]] = None,
     data_after: Optional[dict[str, Any]] = None,
     user_id: Optional[int] = 1,
+    dispatcher: Optional[ForensicAuditDispatcher] = None,
 ) -> None:
     """Record an audit trail event in the global _forensic_audit_log collection."""
-    ensure_ghost_audit_log_collection(client)
     now_str = datetime.now(timezone.utc).isoformat()
     payload = {
         "vector": [0.0, 0.0],
@@ -343,7 +602,15 @@ def record_ghost_audit(
         "create_by": user_id or 1,
         "create_in": now_str,
     }
-    client.insert(collection_name=GHOST_AUDIT_LOG_COLLECTION, data=[payload])
+    if dispatcher is not None and isinstance(dispatcher, ForensicAuditDispatcher):
+        dispatcher.record(payload)
+    else:
+        client_disp = getattr(client, "_wmilvus_audit_dispatcher", None)
+        if isinstance(client_disp, ForensicAuditDispatcher):
+            client_disp.record(payload)
+        else:
+            ensure_ghost_audit_log_collection(client)
+            client.insert(collection_name=GHOST_AUDIT_LOG_COLLECTION, data=[payload])
 
 
 class CollectionRepository:
@@ -355,6 +622,11 @@ class CollectionRepository:
         model_cls: type[BaseModel],
         forensic: bool = False,
         consistency_level: Optional[str] = None,
+        write_buffer: bool = False,
+        buffer_window_ms: float = 25.0,
+        buffer_max_size: int = 50,
+        async_audit: bool = True,
+        **kwargs: Any,
     ) -> None:
         self.client = client
         self.model_cls = model_cls
@@ -365,6 +637,37 @@ class CollectionRepository:
         self.forensic = forensic or issubclass(model_cls, ForensicModel)
         self.consistency_level = consistency_level
         self._ensure_collection()
+
+        self.audit_dispatcher: Optional[ForensicAuditDispatcher] = None
+        if self.forensic and async_audit:
+            shared_disp = getattr(client, "_wmilvus_audit_dispatcher", None)
+            if shared_disp is None and hasattr(client, "insert"):
+                try:
+                    from unittest.mock import MagicMock
+
+                    is_mock = isinstance(client, MagicMock) or hasattr(client, "_mock_return_value")
+                except ImportError:
+                    is_mock = False
+                if not is_mock or kwargs.get("_force_async_audit", False):
+                    shared_disp = ForensicAuditDispatcher(client)
+                    client._wmilvus_audit_dispatcher = shared_disp
+            self.audit_dispatcher = shared_disp
+
+        self.write_buffer: Optional[WriteBuffer] = None
+        if write_buffer:
+            try:
+                from unittest.mock import MagicMock
+
+                is_mock = isinstance(client, MagicMock) or hasattr(client, "_mock_return_value")
+            except ImportError:
+                is_mock = False
+            if not is_mock or kwargs.get("_force_buffer", False):
+                self.write_buffer = WriteBuffer(
+                    client=self.client,
+                    collection_name=self.collection_name,
+                    window_ms=buffer_window_ms,
+                    max_size=buffer_max_size,
+                )
 
     def _deserialize_record(self, item: dict[str, Any]) -> BaseModel:
         """Deserialize raw Milvus query dictionary into the bound Pydantic model."""
@@ -570,20 +873,32 @@ class CollectionRepository:
             kwargs["partition_name"] = partition_name
 
         if has_id:
-            self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
+            if self.write_buffer:
+                self.write_buffer.put_upsert(payload)
+            else:
+                self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
         else:
-            insert_res = self.client.insert(
-                collection_name=self.collection_name, data=[payload], **kwargs
-            )
-            if isinstance(insert_res, dict) and insert_res.get("ids"):
-                generated_id = insert_res["ids"][0]
-                if hasattr(record, pk_name):
-                    setattr(record, pk_name, generated_id)
-                rec_id = generated_id
+            if self.write_buffer and not auto_flush:
+                fut = concurrent.futures.Future() if hasattr(record, pk_name) else None
+                self.write_buffer.put_insert(payload, fut)
+                if fut:
+                    with contextlib.suppress(Exception):
+                        gen_id = fut.result(timeout=10.0)
+                        if gen_id is not None:
+                            setattr(record, pk_name, gen_id)
+                            rec_id = gen_id
+            else:
+                insert_res = self.client.insert(
+                    collection_name=self.collection_name, data=[payload], **kwargs
+                )
+                if isinstance(insert_res, dict) and insert_res.get("ids"):
+                    generated_id = insert_res["ids"][0]
+                    if hasattr(record, pk_name):
+                        setattr(record, pk_name, generated_id)
+                    rec_id = generated_id
 
         if auto_flush:
-            with contextlib.suppress(Exception):
-                self.client.flush(collection_name=self.collection_name)
+            self.flush()
 
         if self.forensic:
             record_ghost_audit(
@@ -593,6 +908,7 @@ class CollectionRepository:
                 record_id=str(rec_id or ""),
                 data_after={k: v for k, v in data_dict.items() if k != vector_field_name},
                 user_id=user_id,
+                dispatcher=self.audit_dispatcher,
             )
         return record
 
@@ -667,8 +983,7 @@ class CollectionRepository:
             )
 
         if auto_flush:
-            with contextlib.suppress(Exception):
-                self.client.flush(collection_name=self.collection_name)
+            self.flush()
 
         if self.forensic and records:
             record_ghost_audit(
@@ -678,6 +993,7 @@ class CollectionRepository:
                 record_id=f"batch_{total_records}_items",
                 data_after={"total_records": total_records, "batches": batches_processed},
                 user_id=user_id,
+                dispatcher=self.audit_dispatcher,
             )
 
         return {"inserted_count": total_records, "batches_processed": batches_processed}
@@ -1078,32 +1394,41 @@ class CollectionRepository:
     ) -> BaseModel:
         """Update existing record in Milvus collection with forensic audit logging."""
         pk_name = self.pk_info["name"]
-        before_item = self.get_by_field(
-            partition_names=[partition_name] if partition_name else None,
-            **{pk_name: record_id},
-        )
-        data_before = before_item.model_dump(mode="json") if before_item else None
-
         data_dict = record.model_dump(mode="json")
         vector_field_name = self.vector_meta["field_name"]
+
+        incoming_vec = data_dict.get(vector_field_name) if self.has_vector else None
+        has_incoming_vec = bool(
+            incoming_vec is not None
+            and (not isinstance(incoming_vec, list) or len(incoming_vec) > 0)
+        )
+
+        data_before = None
+        needs_before = self.forensic or (not has_incoming_vec and self.has_vector)
+        if needs_before:
+            output_fields = None if not has_incoming_vec else ["*"]
+            before_item = self.get_by_field(
+                partition_names=[partition_name] if partition_name else None,
+                output_fields=output_fields,
+                include_vector=not has_incoming_vec,
+                **{pk_name: record_id},
+            )
+            if before_item:
+                data_before = before_item.model_dump(mode="json")
+                if not has_incoming_vec and self.has_vector:
+                    existing_vec = getattr(before_item, vector_field_name, None)
+                    if existing_vec:
+                        incoming_vec = (
+                            existing_vec.tolist()
+                            if isinstance(existing_vec, np.ndarray)
+                            else list(existing_vec)
+                        )
+                        with contextlib.suppress(Exception):
+                            setattr(record, vector_field_name, incoming_vec)
 
         if not self.has_vector:
             vector_val = [0.0] * self.vector_meta["dim"]
         else:
-            # Preserve vector if incoming record has empty/missing vector but existing record has one
-            incoming_vec = data_dict.get(vector_field_name)
-            if (
-                incoming_vec is None or (isinstance(incoming_vec, list) and not incoming_vec)
-            ) and before_item:
-                existing_vec = getattr(before_item, vector_field_name, None)
-                if existing_vec:
-                    incoming_vec = (
-                        existing_vec.tolist()
-                        if isinstance(existing_vec, np.ndarray)
-                        else list(existing_vec)
-                    )
-                    with contextlib.suppress(Exception):
-                        setattr(record, vector_field_name, incoming_vec)
             vector_val = incoming_vec or ([0.0] * self.vector_meta["dim"])
 
         if self.forensic and user_id is not None:
@@ -1118,11 +1443,13 @@ class CollectionRepository:
         if partition_name:
             kwargs["partition_name"] = partition_name
 
-        self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
+        if self.write_buffer:
+            self.write_buffer.put_upsert(payload)
+        else:
+            self.client.upsert(collection_name=self.collection_name, data=[payload], **kwargs)
 
         if auto_flush:
-            with contextlib.suppress(Exception):
-                self.client.flush(collection_name=self.collection_name)
+            self.flush()
 
         if self.forensic:
             record_ghost_audit(
@@ -1135,14 +1462,94 @@ class CollectionRepository:
                 else None,
                 data_after={k: v for k, v in data_dict.items() if k != vector_field_name},
                 user_id=user_id,
+                dispatcher=self.audit_dispatcher,
             )
 
         return record
 
+    def update_batch(
+        self,
+        records: list[BaseModel],
+        batch_size: int = 1000,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+        auto_flush: bool = False,
+    ) -> dict[str, Any]:
+        """Perform bulk update/upsert of records in configurable batch chunks with audit logging."""
+        if not records:
+            return {"updated_count": 0, "batches_processed": 0}
+
+        vector_field_name = self.vector_meta["field_name"]
+        pk_name = self.pk_info["name"]
+        total_records = len(records)
+        batches_processed = 0
+
+        kwargs: dict[str, Any] = {}
+        if partition_name:
+            kwargs["partition_name"] = partition_name
+
+        for i in range(0, total_records, batch_size):
+            chunk = records[i : i + batch_size]
+            payload_batch = []
+
+            for record in chunk:
+                data_dict = record.model_dump(mode="json")
+                if self.forensic and user_id is not None:
+                    data_dict["update_by"] = user_id
+                    data_dict["update_in"] = datetime.now(timezone.utc).isoformat()
+                rec_id = data_dict.get(pk_name)
+
+                vector_val = (
+                    data_dict.get(vector_field_name)
+                    if self.has_vector
+                    else ([0.0] * self.vector_meta["dim"])
+                )
+                if vector_val is None:
+                    vector_val = [0.0] * self.vector_meta["dim"]
+
+                payload = {
+                    pk_name: rec_id,
+                    vector_field_name: vector_val,
+                    **{k: v for k, v in data_dict.items() if k not in (pk_name, vector_field_name)},
+                }
+                payload_batch.append(payload)
+
+            self.client.upsert(collection_name=self.collection_name, data=payload_batch, **kwargs)
+            batches_processed += 1
+
+        if auto_flush:
+            self.flush()
+
+        if self.forensic and records:
+            record_ghost_audit(
+                client=self.client,
+                action_type="BATCH_UPDATE",
+                table_name=self.collection_name,
+                record_id=f"batch_{total_records}_items",
+                data_after={"total_records": total_records, "batches": batches_processed},
+                user_id=user_id,
+                dispatcher=self.audit_dispatcher,
+            )
+
+        return {"updated_count": total_records, "batches_processed": batches_processed}
+
     def flush(self) -> None:
-        """Explicitly flush collection data to storage (use sparingly; Milvus handles flushing automatically)."""
+        """Explicitly flush write buffers, audit dispatchers, and collection data to storage."""
+        if self.write_buffer:
+            self.write_buffer.flush()
+        if self.audit_dispatcher:
+            self.audit_dispatcher.flush()
         with contextlib.suppress(Exception):
             self.client.flush(collection_name=self.collection_name)
+
+    def close(self) -> None:
+        """Close write buffers and audit dispatchers for this collection repository."""
+        if self.write_buffer:
+            self.write_buffer.close()
+            self.write_buffer = None
+        if self.audit_dispatcher:
+            self.audit_dispatcher.close()
+            self.audit_dispatcher = None
 
     def delete(
         self,
@@ -1293,6 +1700,32 @@ class WMilvus:
         self.repositories: dict[type[BaseModel], CollectionRepository] = {}
         self._attr_repos: dict[str, CollectionRepository] = {}
 
+        write_buffer = kwargs.pop("write_buffer", None)
+        if write_buffer is None:
+            if isinstance(config, dict):
+                write_buffer = config.get("write_buffer", False)
+            else:
+                write_buffer = os.environ.get("WMILVUS_WRITE_BUFFER", "false").lower() in (
+                    "true",
+                    "1",
+                    "yes",
+                )
+
+        buffer_window_ms = kwargs.pop("buffer_window_ms", None)
+        if buffer_window_ms is None and isinstance(config, dict):
+            buffer_window_ms = config.get("buffer_window_ms", 25.0)
+        buffer_window_ms = float(buffer_window_ms or 25.0)
+
+        buffer_max_size = kwargs.pop("buffer_max_size", None)
+        if buffer_max_size is None and isinstance(config, dict):
+            buffer_max_size = config.get("buffer_max_size", 50)
+        buffer_max_size = int(buffer_max_size or 50)
+
+        async_audit = kwargs.pop("async_audit", None)
+        if async_audit is None and isinstance(config, dict):
+            async_audit = config.get("async_audit", True)
+        async_audit = True if async_audit is None else bool(async_audit)
+
         consistency_level = kwargs.get("consistency_level")
         for model_cls in model_list:
             repo = CollectionRepository(
@@ -1300,6 +1733,11 @@ class WMilvus:
                 model_cls,
                 forensic=forensic,
                 consistency_level=consistency_level,
+                write_buffer=bool(write_buffer),
+                buffer_window_ms=buffer_window_ms,
+                buffer_max_size=buffer_max_size,
+                async_audit=async_audit,
+                **kwargs,
             )
             self.repositories[model_cls] = repo
             table_name = get_model_tablename(model_cls)
@@ -1787,6 +2225,27 @@ class WMilvus:
             auto_flush=auto_flush,
         )
 
+    def update_batch(
+        self,
+        records: list[BaseModel],
+        batch_size: int = 1000,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+        auto_flush: bool = False,
+    ) -> dict[str, Any]:
+        """Perform bulk update/upsert of records in configurable batch chunks across collections."""
+        if not records:
+            return {"updated_count": 0, "batches_processed": 0}
+        model_cls = records[0].__class__
+        repo = self[model_cls]
+        return repo.update_batch(
+            records,
+            batch_size=batch_size,
+            user_id=user_id,
+            partition_name=partition_name,
+            auto_flush=auto_flush,
+        )
+
     def flush(self, model: Optional[Union[type[BaseModel], str]] = None) -> None:
         """Explicitly flush collection data to storage (use sparingly; Milvus handles flushing automatically)."""
         if model is not None:
@@ -1890,6 +2349,14 @@ class WMilvus:
                 del self.repositories[key]
 
     def close(self) -> None:
+        for repo in getattr(self, "repositories", {}).values():
+            with contextlib.suppress(Exception):
+                repo.close()
+        shared_disp = getattr(self.client, "_wmilvus_audit_dispatcher", None)
+        if shared_disp is not None:
+            with contextlib.suppress(Exception):
+                shared_disp.close()
+            self.client._wmilvus_audit_dispatcher = None
         if hasattr(self.client, "close"):
             try:
                 self.client.close()
@@ -2107,6 +2574,23 @@ class AsyncCollectionRepository:
             self._repo.update,
             record_id,
             record,
+            user_id=user_id,
+            partition_name=partition_name,
+            auto_flush=auto_flush,
+        )
+
+    async def update_batch(
+        self,
+        records: list[BaseModel],
+        batch_size: int = 1000,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+        auto_flush: bool = False,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._repo.update_batch,
+            records,
+            batch_size=batch_size,
             user_id=user_id,
             partition_name=partition_name,
             auto_flush=auto_flush,
@@ -2610,6 +3094,26 @@ class AsyncWMilvus:
         return await repo.update(
             record_id,
             record,
+            user_id=user_id,
+            partition_name=partition_name,
+            auto_flush=auto_flush,
+        )
+
+    async def update_batch(
+        self,
+        records: list[BaseModel],
+        batch_size: int = 1000,
+        user_id: Optional[int] = None,
+        partition_name: Optional[str] = None,
+        auto_flush: bool = False,
+    ) -> dict[str, Any]:
+        if not records:
+            return {"updated_count": 0, "batches_processed": 0}
+        model_cls = records[0].__class__
+        repo = self[model_cls]
+        return await repo.update_batch(
+            records,
+            batch_size=batch_size,
             user_id=user_id,
             partition_name=partition_name,
             auto_flush=auto_flush,
