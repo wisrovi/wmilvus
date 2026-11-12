@@ -301,6 +301,7 @@ def test_wpipe_ingest_step(mock_milvus_client: MagicMock) -> None:
 
     mock_instance = MagicMock()
     mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = []
     mock_milvus_client.return_value = mock_instance
 
     config = {"uri": "http://localhost:19530"}
@@ -1429,6 +1430,7 @@ def test_ensure_ghost_audit_log_collection_memory_cache(mock_milvus_client: Magi
 
     mock_instance = MagicMock()
     mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = []
     mock_milvus_client.return_value = mock_instance
 
     # Clear test cache
@@ -1542,6 +1544,7 @@ def test_update_batch_sync_and_async(mock_milvus_client: MagicMock) -> None:
     """
     mock_instance = MagicMock()
     mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = []
     mock_milvus_client.return_value = mock_instance
 
     db = WMilvus(Person, {"uri": "http://localhost:19530"})
@@ -1613,3 +1616,134 @@ def test_write_buffer_micro_batching_and_flushing(mock_milvus_client: MagicMock)
     assert len(upsert_call.kwargs["data"]) >= 1
 
     buf.close()
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_update_explicit_data_before_bypasses_query(mock_milvus_client: MagicMock) -> None:
+    """Test explicit data_before argument in update() operation.
+
+    Validates that when a caller microservice supplies data_before (either as
+    a Pydantic BaseModel instance or as a dict), update() skips the query
+    roundtrip to Milvus entirely (mock_instance.query.call_count == 0),
+    achieving zero read latency while accurately recording the forensic audit trail.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = []
+    mock_milvus_client.return_value = mock_instance
+
+    db = WMilvus(UserFace, {"uri": "http://localhost:19530"})
+
+    prev_face = UserFace(id="uf_1", name="Original Face", face_vec=[0.1] * 128)
+    new_face = UserFace(id="uf_1", name="Modified Face", face_vec=[0.5] * 128)
+
+    # 1. Update passing BaseModel as data_before
+    db.update("uf_1", new_face, user_id=99, data_before=prev_face)
+
+    # Verify query was NOT called at all
+    assert mock_instance.query.call_count == 0
+    mock_instance.upsert.assert_called_once()
+
+    # 2. Update passing dictionary as data_before
+    mock_instance.upsert.reset_mock()
+    dict_before = {"id": "uf_1", "name": "Dict Face", "face_vec": [0.1] * 128}
+    db.update("uf_1", new_face, user_id=99, data_before=dict_before)
+    assert mock_instance.query.call_count == 0
+    mock_instance.upsert.assert_called_once()
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_update_lru_cache_hit_after_insert_or_get(mock_milvus_client: MagicMock) -> None:
+    """Test in-memory LRU entity cache in CollectionRepository.
+
+    Validates that:
+    1. Inserting an entity populates the local _entity_cache.
+    2. A subsequent update() on that record hits the LRU cache, bypassing the
+       query to Milvus for data_before (mock_instance.query.call_count == 0).
+    3. Querying with get_by_field() also caches the record.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = []
+    mock_milvus_client.return_value = mock_instance
+
+    db = WMilvus(UserFace, {"uri": "http://localhost:19530"})
+
+    # 1. Insert record
+    face = UserFace(id="cached_1", name="Initial Name", face_vec=[0.1] * 128)
+    db.insert(face)
+
+    # Verify entity is stored in cache
+    repo = db[UserFace]
+    cached_val = repo._cache_get("cached_1")
+    assert cached_val is not None
+    assert cached_val["name"] == "Initial Name"
+
+    # 2. Update without passing data_before: cache hit must avoid query
+    mock_instance.query.reset_mock()
+    updated_face = UserFace(id="cached_1", name="Updated Name", face_vec=[0.2] * 128)
+    db.update("cached_1", updated_face, user_id=101)
+
+    assert mock_instance.query.call_count == 0
+    # Cache must now reflect the updated entity
+    assert repo._cache_get("cached_1")["name"] == "Updated Name"
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_update_cache_invalidation_on_delete(mock_milvus_client: MagicMock) -> None:
+    """Test LRU cache eviction when entities are deleted.
+
+    Validates that calling delete() or delete_batch() removes the corresponding
+    entities from the in-memory _entity_cache to prevent stale snapshot reads.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = []
+    mock_milvus_client.return_value = mock_instance
+
+    db = WMilvus(UserFace, {"uri": "http://localhost:19530"})
+    repo = db[UserFace]
+
+    # Pre-populate cache
+    repo._cache_put("del_1", {"id": "del_1", "name": "To Delete 1"})
+    repo._cache_put("del_2", {"id": "del_2", "name": "To Delete 2"})
+    assert repo._cache_get("del_1") is not None
+    assert repo._cache_get("del_2") is not None
+
+    # Delete single ID
+    db.delete("del_1")
+    assert repo._cache_get("del_1") is None
+    assert repo._cache_get("del_2") is not None
+
+    # Delete batch
+    repo._cache_put("del_3", {"id": "del_3", "name": "To Delete 3"})
+    repo.delete_batch(["del_2", "del_3"])
+    assert repo._cache_get("del_2") is None
+    assert repo._cache_get("del_3") is None
+
+
+@patch("wmilvus.core.client.MilvusClient")
+def test_async_update_with_data_before(mock_milvus_client: MagicMock) -> None:
+    """Test AsyncWMilvus and AsyncCollectionRepository update with data_before.
+
+    Validates that asynchronous update operations accept data_before, forward it
+    cleanly to the underlying repository, and avoid query roundtrips.
+    """
+    mock_instance = MagicMock()
+    mock_instance.has_collection.return_value = False
+    mock_instance.query.return_value = []
+    mock_milvus_client.return_value = mock_instance
+
+    async def _run() -> None:
+        async_db = AsyncWMilvus(UserFace, {"uri": "http://localhost:19530"})
+        prev = UserFace(id="a1", name="Async Old", face_vec=[0.1] * 128)
+        curr = UserFace(id="a1", name="Async New", face_vec=[0.3] * 128)
+
+        mock_instance.query.reset_mock()
+        await async_db.update("a1", curr, user_id=42, data_before=prev)
+        assert mock_instance.query.call_count == 0
+        mock_instance.upsert.assert_called_once()
+
+    import asyncio
+
+    asyncio.run(_run())
