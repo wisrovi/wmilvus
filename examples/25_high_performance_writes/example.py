@@ -42,6 +42,13 @@ def main():
         ]
         db.update_batch(items_to_update)
 
+    # Option 3: Zero-Latency Updates via Explicit data_before or In-Memory LRU Cache
+    # Providing data_before avoids the query to Milvus completely (<5ms execution).
+    with WMilvus(Face, uri=uri) as db:
+        old_face = Face(id=1, user_name="User_1_Old", embedding=[0.1] * 128)
+        updated_face = Face(id=1, user_name="User_1_New", embedding=[0.15] * 128)
+        db.update(1, updated_face, data_before=old_face)
+
 
 if __name__ == "__main__":
     main()
