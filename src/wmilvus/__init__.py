@@ -28,7 +28,7 @@ from wmilvus.types import (
     normalize_vector,
 )
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 
 __all__ = [
     "WMilvus",
