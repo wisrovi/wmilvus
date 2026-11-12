@@ -28,6 +28,7 @@
 - **Vector Similarity & Range Search** — KNN similarity search (`search_similar`), similarity distance scores (`search_similar_with_scores`), and similarity range threshold search (`search_range`) with customizable search index parameters (`search_params`).
 - **Batch & Expression Deletion** — Flexible record removal via single ID (`delete`), batch IDs (`delete_batch`), or scalar filter expressions (`delete_by_expr`).
 - **Multi-Vector & Hybrid Search Rankers** — Dense + scalar hybrid search with direct support for Milvus rerankers (`RRFRanker`, `WeightedRanker`).
+- **High-Performance Non-Blocking Writes & Explicit Flushing** — In adherence to official Milvus architecture best practices, automatic forced `flush()` calls after every `insert`, `insert_batch`, and `update` have been removed (`auto_flush=False` by default). This eliminates severe I/O latency bottlenecks, query node memory saturation, and tiny segment fragmentation caused by sealing growing segments prematurely. If immediate read-after-write consistency is needed, Milvus's native `consistency_level="Strong"` or `"Session"` is recommended. Manual flushing is available via `db.flush()` or `db[Model].flush()` when required administratively.
 - **Bulk Vector Ingestion** — High-performance chunked bulk insertion (`insert_batch`) with automatic payload chunking and ID propagation.
 - **Async Client Support (`AsyncWMilvus`)** — Full non-blocking async mirror with `async with` context manager for FastAPI and asyncio applications.
 - **Schema Verification & Dimension Mismatch Detection** — Verification of Pydantic model vector dimensions against active Milvus collection schemas with explicit warning logging when existing server collections deviate from declared dimensions.
@@ -39,7 +40,7 @@
 - **SQLite Vector Backup & Import (`wsqlite`)** — Native ORM-based backup export (`export_to_sqlite`) and restoration (`import_from_sqlite`) powered by `wsqlite`.
 - **Dockerized Test Runner & Coverage** — Out-of-the-box support for isolated container testing (`run_tests_docker.sh`) and HTML coverage reports (`run_coverage.sh`).
 
-## Technical Stack
+## Key Technologies and Libraries
 
 | Component | Technology |
 |-----------|------------|
@@ -105,6 +106,32 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Write Performance & Consistency
+
+By default in `wmilvus>=0.4.6`, automatic `flush()` calls during `insert()`, `insert_batch()`, and `update()` are disabled (`auto_flush=False`). Calling `flush()` after every write is strongly discouraged by official Milvus documentation because it forcibly seals growing segments in memory, writes tiny files to storage, and triggers expensive background compactions.
+
+- **Immediate Visibility / Read-After-Write Consistency**: If your application or tests require immediate visibility of newly inserted entities without incurring I/O penalties, use Milvus's native `consistency_level="Strong"` or `"Session"`:
+  ```python
+  db = WMilvus(UserFace, uri="http://localhost:19530", consistency_level="Strong")
+  ```
+- **Manual Administrative Flush**: When necessary (e.g., before stopping an instance or following an offline migration), trigger a flush explicitly:
+  ```python
+  # Flush all registered collections
+  db.flush()
+
+  # Flush a single collection
+  db[UserFace].flush()
+
+  # Asynchronous flush
+  await async_db.flush()
+  ```
+- **Per-operation Auto-Flush**: If you explicitly want a specific write operation to trigger a flush:
+  ```python
+  db.insert(user, auto_flush=True)
+  db.insert_batch(users, auto_flush=True)
+  db.update("u_001", user, auto_flush=True)
+  ```
 
 ## Organized Examples
 
